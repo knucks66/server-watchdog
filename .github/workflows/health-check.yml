@@ -1,0 +1,99 @@
+name: Server Health Check & Auto-Reboot
+
+on:
+  schedule:
+    # Every 5 minutes (free — unlimited minutes on public repos)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check server health
+        id: health
+        run: |
+          # Check multiple endpoints to confirm server is truly down
+          ENDPOINTS=(
+            "https://api.slotland.rumio.world/api/slot-config"
+            "https://api.axiss.rumio.world/health"
+          )
+
+          FAILURES=0
+          for url in "${ENDPOINTS[@]}"; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "$url" 2>/dev/null || echo "000")
+            echo "  $url → HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "000" ]; then
+              FAILURES=$((FAILURES + 1))
+            fi
+          done
+
+          echo "failures=$FAILURES" >> "$GITHUB_OUTPUT"
+          echo "total=${#ENDPOINTS[@]}" >> "$GITHUB_OUTPUT"
+
+          if [ "$FAILURES" -eq "${#ENDPOINTS[@]}" ]; then
+            echo "status=down" >> "$GITHUB_OUTPUT"
+            echo "⚠️ All endpoints unreachable — server appears down"
+          else
+            echo "status=up" >> "$GITHUB_OUTPUT"
+            echo "✅ Server is healthy ($FAILURES/${#ENDPOINTS[@]} failures)"
+          fi
+
+      - name: Wait and recheck before rebooting
+        if: steps.health.outputs.status == 'down'
+        id: recheck
+        run: |
+          echo "All endpoints failed. Waiting 60s and rechecking..."
+          sleep 60
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
+          echo "Recheck: HTTP $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "000" ]; then
+            echo "still_down=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Still unreachable after 60s — will reboot"
+          else
+            echo "still_down=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Server recovered on recheck"
+          fi
+
+      - name: Reboot server via Hetzner API
+        if: steps.health.outputs.status == 'down' && steps.recheck.outputs.still_down == 'true'
+        run: |
+          echo "🔄 Sending soft reboot request to Hetzner..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.hetzner.cloud/v1/servers/${{ secrets.HETZNER_SERVER_ID }}/actions/reboot" \
+            -H "Authorization: Bearer ${{ secrets.HETZNER_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Hetzner API response: HTTP $HTTP_CODE"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Reboot initiated successfully"
+          else
+            echo "❌ Reboot request failed"
+            exit 1
+          fi
+
+      - name: Wait for server to come back
+        if: steps.health.outputs.status == 'down' && steps.recheck.outputs.still_down == 'true'
+        run: |
+          echo "Waiting 120s for server to boot..."
+          sleep 120
+
+          for i in 1 2 3 4 5; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
+            echo "Post-reboot check $i: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" != "000" ]; then
+              echo "✅ Server is back online"
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo "⚠️ Server did not come back after reboot — may need manual intervention"
+          exit 1
