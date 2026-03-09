@@ -17,6 +17,7 @@ jobs:
           ENDPOINTS=(
             "https://api.slotland.rumio.world/api/slot-config"
             "https://api.axiss.rumio.world/health"
+            "https://api.taxengine.rumio.world/health"
           )
 
           FAILURES=0

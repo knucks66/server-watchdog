@@ -1,0 +1,153 @@
+name: Container Health & Dependency Check
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # Every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  container-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Check container dependencies
+        id: check
+        run: |
+          RESTART_LIST=""
+
+          # ── SuperTokens → Postgres connectivity ──
+          # SuperTokens caches DNS; if Postgres is recreated, SuperTokens loses connection.
+          # Test: hit the SuperTokens JWKS endpoint (requires DB access to work).
+          ST_STATUS=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+            "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3567/.well-known/jwks.json" 2>/dev/null || echo "000")
+          echo "SuperTokens JWKS: HTTP $ST_STATUS"
+
+          if [ "$ST_STATUS" = "000" ] || [ "$ST_STATUS" = "500" ]; then
+            # Double-check with the hello endpoint (no DB needed)
+            ST_HELLO=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+              "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3567/hello" 2>/dev/null || echo "000")
+            echo "SuperTokens hello: HTTP $ST_HELLO"
+
+            if [ "$ST_HELLO" != "000" ] && ([ "$ST_STATUS" = "000" ] || [ "$ST_STATUS" = "500" ]); then
+              # SuperTokens process is running but JWKS fails → DB connection lost
+              echo "⚠️ SuperTokens running but lost DB connection"
+              RESTART_LIST="$RESTART_LIST supertokens"
+            elif [ "$ST_HELLO" = "000" ]; then
+              echo "⚠️ SuperTokens container is not responding at all"
+              RESTART_LIST="$RESTART_LIST supertokens"
+            fi
+          else
+            echo "✅ SuperTokens is healthy"
+          fi
+
+          # ── Hasura → Postgres connectivity ──
+          HASURA_STATUS=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+            "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8080/healthz" 2>/dev/null || echo "000")
+          echo "Hasura health: HTTP $HASURA_STATUS"
+
+          if [ "$HASURA_STATUS" = "000" ] || [ "$HASURA_STATUS" = "500" ]; then
+            echo "⚠️ Hasura is unhealthy"
+            RESTART_LIST="$RESTART_LIST hasura"
+          else
+            echo "✅ Hasura is healthy"
+          fi
+
+          # ── Check for recently recreated Postgres ──
+          # If Postgres was restarted more recently than dependent containers,
+          # those containers likely need a restart to re-resolve DNS.
+          PG_STARTED=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+            "docker inspect --format='{{.State.StartedAt}}' infrastructure-postgres-1 2>/dev/null" || echo "")
+          echo "Postgres started at: $PG_STARTED"
+
+          if [ -n "$PG_STARTED" ]; then
+            DEPENDENTS="infrastructure-supertokens-1 infrastructure-hasura-1"
+            for container in $DEPENDENTS; do
+              CTR_STARTED=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+                "docker inspect --format='{{.State.StartedAt}}' $container 2>/dev/null" || echo "")
+
+              if [ -n "$CTR_STARTED" ] && [ -n "$PG_STARTED" ]; then
+                # Compare timestamps: if Postgres started AFTER the dependent container
+                PG_TS=$(date -d "$PG_STARTED" +%s 2>/dev/null || echo "0")
+                CTR_TS=$(date -d "$CTR_STARTED" +%s 2>/dev/null || echo "0")
+
+                if [ "$PG_TS" -gt "$CTR_TS" ] 2>/dev/null; then
+                  SERVICE=$(echo "$container" | sed 's/infrastructure-//;s/-1$//')
+                  echo "⚠️ $container started before Postgres was recreated — needs restart"
+                  # Only add if not already in list
+                  if ! echo "$RESTART_LIST" | grep -q "$SERVICE"; then
+                    RESTART_LIST="$RESTART_LIST $SERVICE"
+                  fi
+                fi
+              fi
+            done
+          fi
+
+          RESTART_LIST=$(echo "$RESTART_LIST" | xargs)  # trim whitespace
+          echo "restart_list=$RESTART_LIST" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$RESTART_LIST" ]; then
+            echo "needs_restart=true" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "🔄 Containers to restart: $RESTART_LIST"
+          else
+            echo "needs_restart=false" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "✅ All containers healthy"
+          fi
+
+      - name: Restart unhealthy containers
+        if: steps.check.outputs.needs_restart == 'true'
+        run: |
+          RESTART_LIST="${{ steps.check.outputs.restart_list }}"
+          echo "Restarting containers: $RESTART_LIST"
+
+          for service in $RESTART_LIST; do
+            echo "🔄 Restarting $service..."
+            ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+              "cd /opt/infrastructure && docker compose restart $service" 2>&1
+            echo "  Done."
+          done
+
+          echo "Waiting 15s for containers to initialize..."
+          sleep 15
+
+      - name: Verify recovery
+        if: steps.check.outputs.needs_restart == 'true'
+        run: |
+          RESTART_LIST="${{ steps.check.outputs.restart_list }}"
+          ALL_OK=true
+
+          if echo "$RESTART_LIST" | grep -q "supertokens"; then
+            ST_STATUS=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+              "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:3567/.well-known/jwks.json" 2>/dev/null || echo "000")
+            echo "SuperTokens post-restart: HTTP $ST_STATUS"
+            if [ "$ST_STATUS" = "200" ]; then
+              echo "✅ SuperTokens recovered"
+            else
+              echo "❌ SuperTokens still unhealthy"
+              ALL_OK=false
+            fi
+          fi
+
+          if echo "$RESTART_LIST" | grep -q "hasura"; then
+            HASURA_STATUS=$(ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+              "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:8080/healthz" 2>/dev/null || echo "000")
+            echo "Hasura post-restart: HTTP $HASURA_STATUS"
+            if [ "$HASURA_STATUS" = "200" ]; then
+              echo "✅ Hasura recovered"
+            else
+              echo "❌ Hasura still unhealthy"
+              ALL_OK=false
+            fi
+          fi
+
+          if [ "$ALL_OK" = false ]; then
+            echo "⚠️ Some containers did not recover — may need manual intervention"
+            exit 1
+          fi
