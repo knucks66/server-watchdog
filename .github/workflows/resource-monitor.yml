@@ -1,0 +1,151 @@
+name: Resource Monitor & Cleanup
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  resource-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Check disk usage
+        id: disk
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          DISK_PCT=$($SSH "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "0")
+          DISK_AVAIL=$($SSH "df -h / --output=avail | tail -1 | tr -d ' '" 2>/dev/null || echo "unknown")
+          echo "Disk usage: ${DISK_PCT}% (${DISK_AVAIL} available)"
+          echo "disk_pct=$DISK_PCT" >> "$GITHUB_OUTPUT"
+
+          if [ "$DISK_PCT" -ge 85 ]; then
+            echo "needs_cleanup=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Disk usage critical (${DISK_PCT}%) — will run cleanup"
+          elif [ "$DISK_PCT" -ge 70 ]; then
+            echo "needs_cleanup=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Disk usage elevated (${DISK_PCT}%) — monitoring"
+          else
+            echo "needs_cleanup=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Disk usage healthy (${DISK_PCT}%)"
+          fi
+
+      - name: Check memory and swap
+        id: memory
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          MEM_INFO=$($SSH "free -m" 2>/dev/null || echo "")
+          echo "$MEM_INFO"
+
+          MEM_TOTAL=$($SSH "free -m | awk '/Mem:/ {print \$2}'" 2>/dev/null || echo "0")
+          MEM_AVAIL=$($SSH "free -m | awk '/Mem:/ {print \$7}'" 2>/dev/null || echo "0")
+          SWAP_TOTAL=$($SSH "free -m | awk '/Swap:/ {print \$2}'" 2>/dev/null || echo "0")
+          SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "0")
+
+          echo ""
+          echo "RAM available: ${MEM_AVAIL}MB / ${MEM_TOTAL}MB"
+          echo "Swap used: ${SWAP_USED}MB / ${SWAP_TOTAL}MB"
+
+          if [ "$MEM_AVAIL" -lt 300 ] 2>/dev/null; then
+            echo "⚠️ RAM critically low (${MEM_AVAIL}MB available)"
+          fi
+
+          if [ "$SWAP_TOTAL" -gt 0 ] 2>/dev/null; then
+            SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
+            echo "Swap usage: ${SWAP_PCT}%"
+            if [ "$SWAP_PCT" -ge 80 ]; then
+              echo "⚠️ Swap usage critical (${SWAP_PCT}%) — server may need more RAM"
+            fi
+          fi
+
+      - name: Check Docker resource usage
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          echo "=== Docker Disk Usage ==="
+          $SSH "docker system df" 2>/dev/null || true
+
+          echo ""
+          echo "=== Container Memory Usage (top 10) ==="
+          $SSH "docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' | head -11" 2>/dev/null || true
+
+      - name: Detect orphan containers
+        id: orphans
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          echo "=== Checking for orphan containers ==="
+
+          # Known compose projects and their expected working dirs
+          # If a container's compose config file doesn't exist, it's orphaned
+          ORPHANS=""
+          CONTAINERS=$($SSH "docker ps --format '{{.Names}}'" 2>/dev/null || echo "")
+
+          for container in $CONTAINERS; do
+            CONFIG=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' $container 2>/dev/null" || echo "")
+            if [ -n "$CONFIG" ]; then
+              EXISTS=$($SSH "test -f '$CONFIG' && echo yes || echo no" 2>/dev/null || echo "no")
+              if [ "$EXISTS" = "no" ]; then
+                echo "⚠️ Orphan: $container (compose file missing: $CONFIG)"
+                ORPHANS="$ORPHANS $container"
+              fi
+            fi
+          done
+
+          ORPHANS=$(echo "$ORPHANS" | xargs)
+          if [ -n "$ORPHANS" ]; then
+            echo "found_orphans=true" >> "$GITHUB_OUTPUT"
+            echo "orphan_list=$ORPHANS" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "🗑️ Orphan containers: $ORPHANS"
+            echo "  (These are from deleted/moved compose files and waste resources)"
+          else
+            echo "found_orphans=false" >> "$GITHUB_OUTPUT"
+            echo "✅ No orphan containers"
+          fi
+
+      - name: Auto-cleanup disk if critical
+        if: steps.disk.outputs.needs_cleanup == 'true'
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          echo "🧹 Running Docker cleanup..."
+
+          # Remove dangling images
+          PRUNED=$($SSH "docker image prune -f" 2>/dev/null || echo "")
+          echo "$PRUNED"
+
+          # Prune build cache (keep 5GB)
+          echo ""
+          echo "Pruning build cache..."
+          $SSH "docker builder prune -f --keep-storage=5GB" 2>/dev/null | tail -1 || true
+
+          # Remove unused volumes
+          echo ""
+          echo "Pruning unused volumes..."
+          $SSH "docker volume prune -f" 2>/dev/null | tail -1 || true
+
+          # Report new disk usage
+          echo ""
+          NEW_PCT=$($SSH "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "?")
+          echo "Disk usage after cleanup: ${NEW_PCT}%"
+
+      - name: Remove orphan containers
+        if: steps.orphans.outputs.found_orphans == 'true'
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          ORPHANS="${{ steps.orphans.outputs.orphan_list }}"
+
+          echo "Stopping and removing orphan containers: $ORPHANS"
+          for container in $ORPHANS; do
+            echo "  Removing $container..."
+            $SSH "docker stop $container && docker rm $container" 2>&1 || true
+          done

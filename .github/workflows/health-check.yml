@@ -2,9 +2,8 @@ name: Server Health Check & Auto-Reboot
 
 on:
   schedule:
-    # Every 5 minutes (free — unlimited minutes on public repos)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   health-check:
@@ -13,11 +12,17 @@ jobs:
       - name: Check server health
         id: health
         run: |
-          # Check multiple endpoints to confirm server is truly down
+          # All projects routed through Caddy
           ENDPOINTS=(
             "https://api.slotland.rumio.world/api/slot-config"
             "https://api.axiss.rumio.world/health"
             "https://api.taxengine.rumio.world/health"
+            "https://api.podcastwiz.rumio.world/health"
+            "https://api.hhm.rumio.world/health"
+            "https://api.lsg.rumio.world/health"
+            "https://api.daytradepro.rumio.world/health"
+            "https://ai-forge.rumio.world"
+            "https://ownersbox.rumio.world"
           )
 
           FAILURES=0
@@ -37,7 +42,7 @@ jobs:
             echo "⚠️ All endpoints unreachable — server appears down"
           else
             echo "status=up" >> "$GITHUB_OUTPUT"
-            echo "✅ Server is healthy ($FAILURES/${#ENDPOINTS[@]} failures)"
+            echo "✅ Server is reachable ($FAILURES/${#ENDPOINTS[@]} failures)"
           fi
 
       - name: Wait and recheck before rebooting
@@ -47,10 +52,13 @@ jobs:
           echo "All endpoints failed. Waiting 60s and rechecking..."
           sleep 60
 
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
-          echo "Recheck: HTTP $HTTP_CODE"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.podcastwiz.rumio.world/health" 2>/dev/null || echo "000")
+          echo "Recheck (podcastwiz): HTTP $HTTP_CODE"
 
-          if [ "$HTTP_CODE" = "000" ]; then
+          HTTP_CODE2=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
+          echo "Recheck (slotland): HTTP $HTTP_CODE2"
+
+          if [ "$HTTP_CODE" = "000" ] && [ "$HTTP_CODE2" = "000" ]; then
             echo "still_down=true" >> "$GITHUB_OUTPUT"
             echo "⚠️ Still unreachable after 60s — will reboot"
           else
@@ -87,7 +95,7 @@ jobs:
           sleep 120
 
           for i in 1 2 3 4 5; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.podcastwiz.rumio.world/health" 2>/dev/null || echo "000")
             echo "Post-reboot check $i: HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" != "000" ]; then
               echo "✅ Server is back online"
