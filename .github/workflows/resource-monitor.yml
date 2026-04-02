@@ -2,7 +2,7 @@ name: Resource Monitor & Cleanup
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */2 * * *'  # Every 2 hours
   workflow_dispatch:
 
 jobs:
@@ -66,6 +66,87 @@ jobs:
             fi
           fi
 
+      - name: Check and kill zombie processes
+        id: zombies
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          ZOMBIE_COUNT=$($SSH "ps -eo stat | grep -c Z" 2>/dev/null || echo "0")
+          echo "Zombie processes: $ZOMBIE_COUNT"
+
+          if [ "$ZOMBIE_COUNT" -gt 100 ]; then
+            echo "needs_zombie_cleanup=true" >> "$GITHUB_OUTPUT"
+            echo "⚠️ $ZOMBIE_COUNT zombie processes detected — will identify and restart parent containers"
+
+            # Find parent PIDs spawning zombies, with their zombie counts
+            ZOMBIE_PARENTS=$($SSH "ps -eo ppid,stat | awk '\$2 ~ /Z/ {print \$1}' | sort | uniq -c | sort -rn | head -5" 2>/dev/null || echo "")
+            echo ""
+            echo "Top zombie-spawning parents:"
+            echo "$ZOMBIE_PARENTS"
+
+            # For each parent, find its container and restart it
+            while read -r count ppid; do
+              [ -z "$ppid" ] && continue
+              [ "$count" -lt 10 ] && continue
+
+              CGROUP=$($SSH "cat /proc/$ppid/cgroup 2>/dev/null | head -1" || echo "")
+              CONTAINER_ID=$(echo "$CGROUP" | grep -o '[a-f0-9]\{64\}' | head -1)
+
+              if [ -n "$CONTAINER_ID" ]; then
+                CONTAINER_NAME=$($SSH "docker inspect --format '{{.Name}}' ${CONTAINER_ID:0:12}" 2>/dev/null | tr -d '/')
+                WORKDIR=$($SSH "docker inspect --format '{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}' ${CONTAINER_ID:0:12}" 2>/dev/null || echo "")
+                SERVICE=$($SSH "docker inspect --format '{{index .Config.Labels \"com.docker.compose.service\"}}' ${CONTAINER_ID:0:12}" 2>/dev/null || echo "")
+
+                echo ""
+                echo "🔄 Container '$CONTAINER_NAME' (PID $ppid) has $count zombies"
+
+                if [ -n "$WORKDIR" ] && [ -n "$SERVICE" ]; then
+                  echo "  Restarting via compose: cd $WORKDIR && docker compose restart $SERVICE"
+                  $SSH "cd $WORKDIR && docker compose restart $SERVICE" 2>&1
+                else
+                  echo "  Restarting directly: docker restart ${CONTAINER_ID:0:12}"
+                  $SSH "docker restart ${CONTAINER_ID:0:12}" 2>&1
+                fi
+              else
+                echo "⚠️ PID $ppid ($count zombies) is not in a container — skipping"
+              fi
+            done <<< "$ZOMBIE_PARENTS"
+
+            # Verify
+            sleep 5
+            NEW_COUNT=$($SSH "ps -eo stat | grep -c Z" 2>/dev/null || echo "?")
+            echo ""
+            echo "Zombie count after cleanup: $NEW_COUNT (was $ZOMBIE_COUNT)"
+          else
+            echo "needs_zombie_cleanup=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Zombie count acceptable ($ZOMBIE_COUNT)"
+          fi
+
+      - name: Check swap pressure
+        run: |
+          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          SWAP_TOTAL=$($SSH "free -m | awk '/Swap:/ {print \$2}'" 2>/dev/null || echo "0")
+          SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "0")
+          SWAP_FREE=$($SSH "free -m | awk '/Swap:/ {print \$4}'" 2>/dev/null || echo "0")
+
+          if [ "$SWAP_TOTAL" -gt 0 ] 2>/dev/null; then
+            SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
+            echo "Swap: ${SWAP_USED}MB / ${SWAP_TOTAL}MB (${SWAP_PCT}% used, ${SWAP_FREE}MB free)"
+
+            if [ "$SWAP_PCT" -ge 95 ]; then
+              echo "⚠️ Swap nearly exhausted (${SWAP_PCT}%) — clearing kernel caches"
+              $SSH "sync && echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+
+              NEW_SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "?")
+              echo "Swap after cache drop: ${NEW_SWAP_USED}MB (was ${SWAP_USED}MB)"
+            elif [ "$SWAP_PCT" -ge 80 ]; then
+              echo "⚠️ Swap usage elevated (${SWAP_PCT}%) — monitoring"
+            else
+              echo "✅ Swap usage healthy (${SWAP_PCT}%)"
+            fi
+          fi
+
       - name: Check Docker resource usage
         run: |
           SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
@@ -126,7 +207,7 @@ jobs:
           # Prune build cache (keep 5GB)
           echo ""
           echo "Pruning build cache..."
-          $SSH "docker builder prune -f --keep-storage=5GB" 2>/dev/null | tail -1 || true
+          $SSH "docker builder prune -f --keep-storage=2GB" 2>/dev/null | tail -1 || true
 
           # Remove unused volumes
           echo ""

@@ -1,0 +1,29 @@
+# Health check endpoints — monitored every 5 minutes
+# Add new entries here (or via the site creation wizard) to auto-monitor them
+#
+# Format: each entry needs a url and a name
+# The health-check workflow reads this file from the repo at runtime
+
+endpoints:
+  - name: Slotland
+    url: https://api.slotland.rumio.world/api/slot-config
+  - name: AXISS
+    url: https://api.axiss.rumio.world/health
+  - name: TaxEngine
+    url: https://api.taxengine.rumio.world/health
+  - name: PodcastWiz
+    url: https://api.podcastwiz.rumio.world/health
+  - name: HHM
+    url: https://api.hhm.rumio.world/health
+  - name: LSG
+    url: https://api.lsg.rumio.world/health
+  - name: DayTradePro
+    url: https://api.daytradepro.rumio.world/health
+  - name: AI Forge
+    url: https://ai-forge.rumio.world
+  - name: OwnersBox
+    url: https://ownersbox.rumio.world
+  - name: KittyCams
+    url: https://api.kittycams.rumio.world/health
+  - name: Pawsome Pets
+    url: https://api.pawsome-pets.rumio.world/health

@@ -9,40 +9,36 @@ jobs:
   health-check:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Check server health
         id: health
         run: |
-          # All projects routed through Caddy
-          ENDPOINTS=(
-            "https://api.slotland.rumio.world/api/slot-config"
-            "https://api.axiss.rumio.world/health"
-            "https://api.taxengine.rumio.world/health"
-            "https://api.podcastwiz.rumio.world/health"
-            "https://api.hhm.rumio.world/health"
-            "https://api.lsg.rumio.world/health"
-            "https://api.daytradepro.rumio.world/health"
-            "https://ai-forge.rumio.world"
-            "https://ownersbox.rumio.world"
-          )
+          # Read endpoints from config file
+          ENDPOINTS=$(grep '^\s*url:' endpoints.yml | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'")
 
           FAILURES=0
-          for url in "${ENDPOINTS[@]}"; do
+          TOTAL=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            TOTAL=$((TOTAL + 1))
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "$url" 2>/dev/null || echo "000")
             echo "  $url → HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" = "000" ]; then
               FAILURES=$((FAILURES + 1))
             fi
-          done
+          done <<< "$ENDPOINTS"
 
           echo "failures=$FAILURES" >> "$GITHUB_OUTPUT"
-          echo "total=${#ENDPOINTS[@]}" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
 
-          if [ "$FAILURES" -eq "${#ENDPOINTS[@]}" ]; then
+          if [ "$FAILURES" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
             echo "status=down" >> "$GITHUB_OUTPUT"
             echo "⚠️ All endpoints unreachable — server appears down"
           else
             echo "status=up" >> "$GITHUB_OUTPUT"
-            echo "✅ Server is reachable ($FAILURES/${#ENDPOINTS[@]} failures)"
+            echo "✅ Server is reachable ($FAILURES/$TOTAL failures)"
           fi
 
       - name: Wait and recheck before rebooting
@@ -52,13 +48,19 @@ jobs:
           echo "All endpoints failed. Waiting 60s and rechecking..."
           sleep 60
 
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.podcastwiz.rumio.world/health" 2>/dev/null || echo "000")
-          echo "Recheck (podcastwiz): HTTP $HTTP_CODE"
+          # Recheck with first two endpoints from config
+          ENDPOINTS=$(grep '^\s*url:' endpoints.yml | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'" | head -2)
+          STILL_DOWN=true
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "$url" 2>/dev/null || echo "000")
+            echo "Recheck: $url → HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" != "000" ]; then
+              STILL_DOWN=false
+            fi
+          done <<< "$ENDPOINTS"
 
-          HTTP_CODE2=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.slotland.rumio.world/api/slot-config" 2>/dev/null || echo "000")
-          echo "Recheck (slotland): HTTP $HTTP_CODE2"
-
-          if [ "$HTTP_CODE" = "000" ] && [ "$HTTP_CODE2" = "000" ]; then
+          if [ "$STILL_DOWN" = "true" ]; then
             echo "still_down=true" >> "$GITHUB_OUTPUT"
             echo "⚠️ Still unreachable after 60s — will reboot"
           else
@@ -94,8 +96,9 @@ jobs:
           echo "Waiting 120s for server to boot..."
           sleep 120
 
+          RECHECK_URL=$(grep '^\s*url:' endpoints.yml | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'" | head -1)
           for i in 1 2 3 4 5; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "https://api.podcastwiz.rumio.world/health" 2>/dev/null || echo "000")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "$RECHECK_URL" 2>/dev/null || echo "000")
             echo "Post-reboot check $i: HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" != "000" ]; then
               echo "✅ Server is back online"

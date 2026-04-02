@@ -6,22 +6,13 @@ Automated health monitoring for the Hetzner server. Runs via GitHub Actions (fre
 
 ### 1. Server Health Check & Auto-Reboot (`health-check.yml`)
 
-Runs every **5 minutes**. Checks HTTP endpoints for all projects.
+Runs every **5 minutes**. Checks HTTP endpoints from `endpoints.yml`.
 
 - If all endpoints are unreachable, waits 60s and rechecks (avoids false positives)
 - If still down, triggers a soft reboot via the Hetzner Cloud API
 - Verifies the server comes back online
 
-**Monitored endpoints:**
-- `api.slotland.rumio.world` — Slotland
-- `api.axiss.rumio.world` — AXISS
-- `api.taxengine.rumio.world` — TaxEngine
-- `api.podcastwiz.rumio.world` — PodcastWiz
-- `api.hhm.rumio.world` — HHM
-- `api.lsg.rumio.world` — LSG
-- `api.daytradepro.rumio.world` — DayTradePro
-- `ai-forge.rumio.world` — AI Forge
-- `ownersbox.rumio.world` — OwnersBox
+**Adding endpoints:** Edit `endpoints.yml` or use the site creation wizard (auto-registers new sites).
 
 ### 2. Container Health & Dependency Check (`container-health.yml`)
 
@@ -37,11 +28,12 @@ Runs every **10 minutes**. SSHes into the server and checks container-level heal
 
 ### 3. Resource Monitor & Cleanup (`resource-monitor.yml`)
 
-Runs every **6 hours**. SSHes into the server and monitors resource usage.
+Runs every **2 hours**. SSHes into the server and monitors resource usage.
 
 **What it checks:**
-- Disk usage (auto-cleanup at ≥85%: prunes images, build cache, unused volumes)
-- RAM and swap usage (warns when critically low)
+- Disk usage (auto-cleanup at >=85%: prunes images, build cache, unused volumes)
+- RAM and swap usage (warns when critically low, drops caches at >=95% swap)
+- Zombie processes (auto-restarts parent containers when >100 zombies detected)
 - Docker resource breakdown (images, containers, volumes, build cache)
 - Container memory/CPU usage (top 10)
 - Orphan containers (from deleted/moved compose files) — auto-removes them
