@@ -76,6 +76,34 @@ jobs:
             done
           fi
 
+          # ── Wyze Bridge health (file descriptor exhaustion, crashes) ──
+          WB_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/" 2>/dev/null || echo "000")
+          echo "Wyze Bridge: HTTP $WB_STATUS"
+
+          if [ "$WB_STATUS" = "000" ] || [ "$WB_STATUS" = "500" ] || [ "$WB_STATUS" = "502" ]; then
+            # Double-check with a camera API call (the bridge UI might be slow but cameras work)
+            WB_API=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/api/" 2>/dev/null || echo "000")
+            echo "Wyze Bridge API: HTTP $WB_API"
+
+            if [ "$WB_API" = "000" ] || [ "$WB_API" = "500" ] || [ "$WB_API" = "502" ]; then
+              echo "⚠️ Wyze Bridge is unhealthy — restarting"
+              $SSH "docker restart wyze-bridge" 2>&1
+              echo "  Waiting 15s for Wyze Bridge to reconnect cameras..."
+              sleep 15
+
+              WB_VERIFY=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
+              if [ "$WB_VERIFY" = "200" ]; then
+                echo "✅ Wyze Bridge recovered"
+              else
+                echo "❌ Wyze Bridge still unhealthy after restart (HTTP $WB_VERIFY)"
+              fi
+            else
+              echo "✅ Wyze Bridge API responding (UI may be slow)"
+            fi
+          else
+            echo "✅ Wyze Bridge is healthy"
+          fi
+
           # ── Detect unhealthy containers ──
           echo ""
           echo "=== Checking for unhealthy containers ==="
@@ -160,6 +188,14 @@ jobs:
               echo "❌ Hasura still unhealthy"
               ALL_OK=false
             fi
+          fi
+
+          # Also verify Wyze Bridge if it was just restarted
+          WB_CHECK=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
+          if [ "$WB_CHECK" = "200" ]; then
+            echo "✅ Wyze Bridge healthy"
+          elif [ "$WB_CHECK" = "000" ]; then
+            echo "⚠️ Wyze Bridge not responding (may still be starting)"
           fi
 
           if [ "$ALL_OK" = false ]; then
