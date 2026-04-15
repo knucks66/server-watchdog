@@ -33,3 +33,5 @@ endpoints:
     url: https://api.superior-drones.com/health
   - name: LaSalle Cat Tree
     url: https://api.lasallecattree.com/health
+  - name: Rumio
+    url: https://api.rumio.world/health
