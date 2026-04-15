@@ -25,5 +25,11 @@ endpoints:
     url: https://ownersbox.rumio.world
   - name: KittyCams
     url: https://api.kittycams.rumio.world/health
-  - name: Pawsome Pets
-    url: https://api.pawsome-pets.rumio.world/health
+  - name: The Ledger Lab Academy
+    url: https://api.theledgerlab.academy/health
+  - name: Ken's Designs
+    url: https://api.kens-designs.rumio.world/health
+  - name: Superior Drones
+    url: https://api.superior-drones.com/health
+  - name: LaSalle Cat Tree
+    url: https://api.lasallecattree.com/health
