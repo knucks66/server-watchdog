@@ -35,3 +35,5 @@ endpoints:
     url: https://api.lasallecattree.com/health
   - name: Rumio
     url: https://api.rumio.world/health
+  - name: WhatAreWeHavingForDinner
+    url: https://api.whatarewehavingfordinner.rumio.world/health
