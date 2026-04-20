@@ -37,3 +37,5 @@ endpoints:
     url: https://api.rumio.world/health
   - name: WhatAreWeHavingForDinner
     url: https://api.whatarewehavingfordinner.rumio.world/health
+  - name: WhatAreWeMakingForDinner
+    url: https://api.whatarewemakingfordinner.com/health
