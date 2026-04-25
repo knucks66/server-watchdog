@@ -80,6 +80,7 @@ jobs:
           WB_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/" 2>/dev/null || echo "000")
           echo "Wyze Bridge: HTTP $WB_STATUS"
 
+          WB_RESTARTED=false
           if [ "$WB_STATUS" = "000" ] || [ "$WB_STATUS" = "500" ] || [ "$WB_STATUS" = "502" ]; then
             # Double-check with a camera API call (the bridge UI might be slow but cameras work)
             WB_API=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/api/" 2>/dev/null || echo "000")
@@ -88,6 +89,7 @@ jobs:
             if [ "$WB_API" = "000" ] || [ "$WB_API" = "500" ] || [ "$WB_API" = "502" ]; then
               echo "⚠️ Wyze Bridge is unhealthy — restarting"
               $SSH "docker restart wyze-bridge" 2>&1
+              WB_RESTARTED=true
               echo "  Waiting 15s for Wyze Bridge to reconnect cameras..."
               sleep 15
 
@@ -102,6 +104,69 @@ jobs:
             fi
           else
             echo "✅ Wyze Bridge is healthy"
+          fi
+
+          # ── Wyze Bridge motion-event staleness ──
+          # Different failure mode than the HTTP check above: the bridge stays
+          # HTTP-200 but its cloud Events API subscription silently drifts and
+          # stops delivering motion events. The recorder is motion-gated, so it
+          # looks healthy in logs but produces no clips. Symptom: motion_ts
+          # frozen at an old timestamp across every camera.
+          if [ "$WB_RESTARTED" = "true" ]; then
+            echo "Skipping motion staleness check — Wyze Bridge was just restarted"
+          else
+            WB_STARTED=$($SSH "docker inspect --format='{{.State.StartedAt}}' wyze-bridge 2>/dev/null" || echo "")
+            if [ -z "$WB_STARTED" ]; then
+              echo "Wyze Bridge not running — skipping motion staleness check"
+            else
+              NOW=$($SSH "date +%s")
+              WB_START_TS=$($SSH "date -d '$WB_STARTED' +%s 2>/dev/null" || echo "0")
+              WB_AGE=$((NOW - WB_START_TS))
+
+              if [ "$WB_AGE" -lt 3600 ]; then
+                echo "Wyze Bridge started ${WB_AGE}s ago — skipping motion staleness check (cold-start grace)"
+              else
+                CAMS=$($SSH "curl -s --max-time 5 http://localhost:5050/" 2>/dev/null | grep -oE 'data-cam="[^"]+"' | cut -d'"' -f2 | sort -u)
+                if [ -z "$CAMS" ]; then
+                  echo "No cameras enumerated from Wyze Bridge homepage — skipping staleness check"
+                else
+                  MAX_TS=0
+                  for cam in $CAMS; do
+                    TS=$($SSH "curl -s --max-time 5 http://localhost:5050/api/$cam" 2>/dev/null | grep -oE '"motion_ts":[0-9]+' | head -1 | cut -d: -f2)
+                    TS=${TS:-0}
+                    if [ "$TS" -gt "$MAX_TS" ]; then MAX_TS=$TS; fi
+                  done
+
+                  STALE_THRESHOLD=21600  # 6 hours
+                  if [ "$MAX_TS" = "0" ]; then
+                    echo "⚠️ Wyze Bridge has never reported motion (bridge up ${WB_AGE}s) — Events API likely broken"
+                    SHOULD_RESTART=true
+                  else
+                    AGE=$((NOW - MAX_TS))
+                    if [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
+                      echo "⚠️ Wyze Bridge newest motion_ts is ${AGE}s old (threshold ${STALE_THRESHOLD}s) — Events API drifted"
+                      SHOULD_RESTART=true
+                    else
+                      echo "✅ Wyze Bridge motion events flowing (newest ${AGE}s old)"
+                      SHOULD_RESTART=false
+                    fi
+                  fi
+
+                  if [ "$SHOULD_RESTART" = "true" ]; then
+                    echo "  Restarting wyze-bridge to refresh cloud Events subscription..."
+                    $SSH "docker restart wyze-bridge" 2>&1
+                    echo "  Waiting 15s..."
+                    sleep 15
+                    WB_VERIFY=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
+                    if [ "$WB_VERIFY" = "200" ]; then
+                      echo "✅ Wyze Bridge restarted (motion events should flow within ~5min)"
+                    else
+                      echo "❌ Wyze Bridge not responding after restart (HTTP $WB_VERIFY)"
+                    fi
+                  fi
+                fi
+              fi
+            fi
           fi
 
           # ── Detect unhealthy containers ──

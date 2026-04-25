@@ -22,6 +22,8 @@ Runs every **10 minutes**. SSHes into the server and checks container-level heal
 - SuperTokens → Postgres connectivity (JWKS endpoint vs hello endpoint)
 - Hasura → Postgres connectivity (healthz endpoint)
 - Postgres start time vs dependent containers (detects stale DNS after Postgres recreation)
+- Wyze Bridge HTTP health (file descriptor exhaustion, crashes)
+- Wyze Bridge motion-event staleness — detects when the bridge's cloud Events API subscription silently drifts (HTTP stays 200, but `motion_ts` frozen across all cameras for >6h). Vigil's recorder is motion-gated, so this failure produces zero clips with no error logs. Restarts the bridge to refresh the subscription.
 - **All containers with Docker health checks** — detects and restarts any container reporting `unhealthy`
 
 **Remediation:** Restarts only the affected container(s) via `docker compose restart` (uses compose labels to find the right project/file). No full server reboot needed.
