@@ -12,15 +12,26 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          # Strip any CRLF from the secret (common cause of "error in libcrypto"
+          # when the key was pasted from a Windows clipboard).
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Sentinel check — fail the workflow immediately if SSH doesn't work,
+          # rather than letting every downstream `ssh ... || echo "0"` fail
+          # silently and trigger fail2ban with password retries.
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY secret and that the runner IP is not banned by fail2ban on the server"
+            exit 1
+          fi
+          echo "✅ SSH connectivity verified"
 
       - name: Check container dependencies
         id: check
         run: |
           RESTART_LIST=""
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           # ── SuperTokens → Postgres connectivity ──
           ST_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3567/.well-known/jwks.json" 2>/dev/null || echo "000")
@@ -218,7 +229,7 @@ jobs:
 
           for service in $RESTART_LIST; do
             echo "🔄 Restarting $service..."
-            ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
+            ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
               "cd /opt/infrastructure && docker compose restart $service" 2>&1
             echo "  Done."
           done
@@ -229,7 +240,7 @@ jobs:
       - name: Verify recovery
         if: steps.check.outputs.needs_restart == 'true'
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
           RESTART_LIST="${{ steps.check.outputs.restart_list }}"
           ALL_OK=true
 

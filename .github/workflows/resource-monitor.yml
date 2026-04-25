@@ -12,14 +12,25 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          # Strip any CRLF from the secret (common cause of "error in libcrypto"
+          # when the key was pasted from a Windows clipboard).
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Sentinel check — fail the workflow immediately if SSH doesn't work,
+          # rather than letting every downstream `ssh ... || echo "0"` mask the
+          # failure (causing the workflow to "succeed" with all-zero metrics).
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY secret and that the runner IP is not banned by fail2ban on the server"
+            exit 1
+          fi
+          echo "✅ SSH connectivity verified"
 
       - name: Check disk usage
         id: disk
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           DISK_PCT=$($SSH "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "0")
           DISK_AVAIL=$($SSH "df -h / --output=avail | tail -1 | tr -d ' '" 2>/dev/null || echo "unknown")
@@ -40,7 +51,7 @@ jobs:
       - name: Check memory and swap
         id: memory
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           MEM_INFO=$($SSH "free -m" 2>/dev/null || echo "")
           echo "$MEM_INFO"
@@ -69,7 +80,7 @@ jobs:
       - name: Check and kill zombie processes
         id: zombies
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           ZOMBIE_COUNT=$($SSH "ps -eo stat | grep -c Z" 2>/dev/null || echo "0")
           echo "Zombie processes: $ZOMBIE_COUNT"
@@ -124,7 +135,7 @@ jobs:
 
       - name: Check swap pressure
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           SWAP_TOTAL=$($SSH "free -m | awk '/Swap:/ {print \$2}'" 2>/dev/null || echo "0")
           SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "0")
@@ -149,7 +160,7 @@ jobs:
 
       - name: Check Docker resource usage
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           echo "=== Docker Disk Usage ==="
           $SSH "docker system df" 2>/dev/null || true
@@ -161,7 +172,7 @@ jobs:
       - name: Detect orphan containers
         id: orphans
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           echo "=== Checking for orphan containers ==="
 
@@ -196,7 +207,7 @@ jobs:
       - name: Auto-cleanup disk if critical
         if: steps.disk.outputs.needs_cleanup == 'true'
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
           echo "🧹 Running Docker cleanup..."
 
@@ -222,7 +233,7 @@ jobs:
       - name: Remove orphan containers
         if: steps.orphans.outputs.found_orphans == 'true'
         run: |
-          SSH="ssh -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
           ORPHANS="${{ steps.orphans.outputs.orphan_list }}"
 
           echo "Stopping and removing orphan containers: $ORPHANS"
