@@ -39,3 +39,5 @@ endpoints:
     url: https://api.whatarewehavingfordinner.rumio.world/health
   - name: WhatAreWeMakingForDinner
     url: https://api.whatarewemakingfordinner.com/health
+  - name: DaiyTradePro
+    url: https://api.daiytradepro.com/health
