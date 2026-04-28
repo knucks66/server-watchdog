@@ -41,3 +41,5 @@ endpoints:
     url: https://api.whatarewemakingfordinner.com/health
   - name: DaiyTradePro
     url: https://api.daiytradepro.com/health
+  - name: Hamtramck Historical Museum
+    url: https://api.hamtramck-historical-museum.rumio.world/health
