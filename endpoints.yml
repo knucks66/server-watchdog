@@ -45,3 +45,5 @@ endpoints:
     url: https://api.hamtramck-historical-museum.rumio.world/health
   - name: Planpicturedrocks
     url: https://api.planpicturedrocks.rumio.world/health
+  - name: Axiss Support
+    url: https://api.axiss.support/health
