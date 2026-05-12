@@ -47,3 +47,5 @@ endpoints:
     url: https://api.planpicturedrocks.rumio.world/health
   - name: Axiss Support
     url: https://api.axiss.support/health
+  - name: podcasty
+    url: https://api.podcasty.rumio.world/health
