@@ -49,3 +49,5 @@ endpoints:
     url: https://api.axiss.support/health
   - name: podcasty
     url: https://api.podcasty.rumio.world/health
+  - name: As-Isy
+    url: https://api.as-isy.rumio.world/health
