@@ -51,3 +51,5 @@ endpoints:
     url: https://api.podcasty.rumio.world/health
   - name: As-Isy
     url: https://api.as-isy.rumio.world/health
+  - name: Vigil Security
+    url: https://api.vigil-security.rumio.world/health
