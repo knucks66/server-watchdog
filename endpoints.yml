@@ -53,3 +53,5 @@ endpoints:
     url: https://api.as-isy.rumio.world/health
   - name: Vigil Security
     url: https://api.vigil-security.rumio.world/health
+  - name: Slotlandia
+    url: https://api.slotlandia.rumio.world/health
