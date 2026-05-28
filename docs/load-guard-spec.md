@@ -1,6 +1,7 @@
 # Spec: Memory & Load Pressure Guard
 
-**Status:** proposed
+**Status:** Layer 1 applied; Layers 2 & 3 implemented (`load-guard.yml` +
+`scripts/load-guard.sh` + `systemd/load-guard.{service,timer}`).
 **Author:** follow-up to the 2026-05-28 fleet-wide outage
 **Owner:** server-watchdog
 

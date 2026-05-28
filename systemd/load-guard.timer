@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the memory & load pressure guard every 2 minutes
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/load-guard-spec.md
+
+[Timer]
+# Fast local cadence — this is the fail-safe for when GitHub deprioritizes the
+# scheduled Layer 2 workflow under load (a 56-min gap was observed during the
+# 2026-05-28 outage). 2 min + the engine's 2-sample debounce ⇒ acts after
+# ~2–4 min of sustained pressure.
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

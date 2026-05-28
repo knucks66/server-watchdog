@@ -1,0 +1,110 @@
+name: Load Guard
+
+# Layer 2 of the Memory & Load Pressure Guard (docs/load-guard-spec.md).
+# Runs the guard engine on the box every 5 minutes and raises Discord alerts on
+# state changes. The engine itself (detect → debounce → shed builds → restart
+# postgres) is shared with Layer 3's on-box 2-minute timer; a flock + statefile
+# keep the two cadences coordinated. This workflow is the cloud-visible cadence
+# + alerting + backstop for when the on-box timer is missing.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:
+
+# Don't pile up runs if one is slow (e.g. SSH hangs during an incident).
+concurrency:
+  group: load-guard
+  cancel-in-progress: false
+
+jobs:
+  load-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY / SERVER_IP and fail2ban"
+            exit 1
+          fi
+          echo "✅ SSH connectivity verified"
+
+      - name: Run guard engine on the box
+        id: guard
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
+
+          # Pipe the repo's engine to the box and run it as root. Using the
+          # repo copy (not the installed one) means this layer always runs the
+          # latest engine and works even if Layer 3 isn't installed.
+          OUT=$($SSH 'bash -s' < scripts/load-guard.sh 2>&1 || true)
+          echo "$OUT"
+
+          RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
+          LEVEL=$(printf '%s' "$RESULT" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+          ACTION=$(printf '%s' "$RESULT" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+          [ -z "$LEVEL" ] && LEVEL=unknown
+          [ -z "$ACTION" ] && ACTION=unknown
+
+          echo "level=$LEVEL"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Load Guard"
+            echo ""
+            echo "- level: \`$LEVEL\`"
+            echo "- action: \`$ACTION\`"
+            echo "- raw: \`$RESULT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alert on state change (Discord)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "No DISCORD_WEBHOOK_URL secret — skipping alert (detection/remediation still ran)."
+            exit 0
+          fi
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          LEVEL="${{ steps.guard.outputs.level }}"
+          ACTION="${{ steps.guard.outputs.action }}"
+          RESULT="${{ steps.guard.outputs.result }}"
+
+          # Map to a coarse alert key so we fire only on transitions, not every
+          # tick (ownersbox-style state-change dedup).
+          case "$ACTION" in
+            shed_builds*|restarted_postgres*|*restarted_postgres*) KEY="REMEDIATED" ;;
+            *) case "$LEVEL" in critical*) KEY="CRITICAL" ;; *) KEY="OK" ;; esac ;;
+          esac
+
+          PREV=$($SSH "cat /run/load-guard.alerted 2>/dev/null" || echo "OK")
+          PREV=${PREV:-OK}
+          echo "alert key: prev=$PREV now=$KEY"
+
+          if [ "$KEY" = "$PREV" ]; then
+            echo "No state change ($KEY) — no alert."
+            exit 0
+          fi
+
+          # Persist the new key for next-run dedup.
+          $SSH "printf '%s' '$KEY' > /run/load-guard.alerted" || true
+
+          if [ "$KEY" = "OK" ]; then
+            MSG="✅ **Load Guard recovered** — pressure cleared. \`$RESULT\`"
+          elif [ "$KEY" = "REMEDIATED" ]; then
+            MSG="🛠️ **Load Guard acted** on the Hetzner box — \`$RESULT\`"
+          else
+            MSG="⚠️ **Load Guard: critical pressure** on the Hetzner box — \`$RESULT\`"
+          fi
+
+          curl -fsS -H 'Content-Type: application/json' \
+            -d "$(printf '{"content": %s}' "$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")" \
+            "$DISCORD_WEBHOOK_URL" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"
