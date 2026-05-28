@@ -43,20 +43,24 @@ Runs every **2 hours**. SSHes into the server and monitors resource usage.
 ### 4. Load Guard (`load-guard.yml`)
 
 Runs every **5 minutes**. Runs the shared guard engine (`scripts/load-guard.sh`)
-on the box and raises Discord alerts on state changes.
+on the box and sends ntfy push alerts on state changes.
 
-**What it checks:** 1-min load (critical at `cores × 4`), `MemAvailable`, swap %.
-Debounces over two consecutive samples so a momentary spike doesn't trigger.
+**What it checks:** 1-min load (critical at `cores × 4`), `MemAvailable`, swap %
+(swap only counts when MemAvailable is also low — avoids stale-swap false
+positives). Debounces over two consecutive samples so a momentary spike doesn't
+trigger.
 
 **Remediation (only on sustained critical):**
-- Sheds runaway *build* processes (`vite`/`esbuild`/`rollup`/`tsc -b`) — the
-  cause of the 2026-05-28 OOM. Build-only tools, safe to kill.
 - Restarts postgres if it has gone unhealthy (the victim), via compose labels.
+- Does NOT kill builds box-wide — Layer 1's `runners.slice` cap contains runaway
+  *builds* structurally, and `pkill esbuild` would hit vitest/CI. An opt-in
+  `SHED_BUILDS=1` backstop targets only `vite build`/`npm run build` inside
+  `runners.slice`.
 
 The same engine runs on-box every **2 minutes** via a systemd timer (Layer 3,
 `scripts/install-load-guard.sh`) — the fast local fail-safe for when GitHub
 deprioritizes the scheduled run under load. The two cadences coordinate via a
-flock + statefile. Alerting is Discord, state-change-deduplicated.
+flock + statefile. Alerting is ntfy push, state-change-deduplicated.
 
 ## Runner memory cap (cgroup slice)
 
@@ -82,4 +86,4 @@ fail-safe (Layer 3).
 | `HETZNER_SERVER_ID` | health-check | Hetzner server ID |
 | `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard | Ed25519 private key for root@server |
 | `SERVER_IP` | container-health, resource-monitor, load-guard | Server IP address |
-| `DISCORD_WEBHOOK_URL` | load-guard | Discord webhook for pressure alerts (optional — detection/remediation run without it) |
+| `NTFY_URL` | load-guard | Full ntfy topic URL (e.g. `https://ntfy.sh/<private-topic>`) for push alerts (optional — detection/remediation run without it) |

@@ -126,33 +126,33 @@ GitHub `schedule:` runs are deprioritized exactly during high-load incidents (ob
 
 ## Alerting
 
-`resource-monitor.yml` currently only `echo`s; there's no notify channel in this repo's secrets. ownersbox already posts to Discord. Two options:
-
-1. Add a `DISCORD_WEBHOOK_URL` secret to server-watchdog and POST from `load-guard.yml` on any remediation.
-2. Route through ownersbox's existing alert pipeline (it's the monitoring hub) via a small internal endpoint.
-
-Recommend (1) for independence — the watchdog shouldn't depend on the thing it might be rescuing.
+`load-guard.yml` pushes via **ntfy** (`https://ntfy.sh/<topic>`) on state changes,
+deduped against `/run/load-guard.alerted` so it fires once per transition, not
+per tick. Chosen over Discord (not used here) and email (less urgent for a
+"box is dying" alert) — ntfy is a drop-in `curl POST` that reaches the phone
+instantly, free, no account, and self-hostable later. The watchdog stays
+independent of the platform it might be rescuing.
 
 ## Secrets
 
 | Secret | New? | Used by |
 |---|---|---|
 | `SSH_PRIVATE_KEY`, `SERVER_IP` | existing | load-guard SSH |
-| `DISCORD_WEBHOOK_URL` | **new** | load-guard alerting |
+| `NTFY_URL` | **new** | load-guard alerting (full ntfy topic URL; optional) |
 | `HETZNER_API_TOKEN`, `HETZNER_SERVER_ID` | existing | unchanged (reboot path stays in health-check) |
 
 ## Validation plan
 
 1. **Layer 1:** in a throwaway CI job, `stress-ng --vm 2 --vm-bytes 4G --timeout 60s`; confirm the slice OOM-kills it at 7 GB and host `free -m` + `docker inspect postgres` stay healthy.
-2. **Layer 2/3:** `stress-ng --cpu 16` to push load > 32; confirm the guard detects within one cycle, sheds (if build procs present) or logs, restarts postgres only if unhealthy, and emits exactly one Discord alert (not one per tick).
-3. **Self-match regression:** confirm the pkill bracket-guard does not kill the guard's own shell.
+2. **Layer 2/3:** `stress-ng --cpu 16` to push load > 32; confirm the guard detects within one cycle, restarts postgres only if unhealthy, and emits exactly one ntfy alert (not one per tick).
+3. **Stale-swap regression:** confirm high swap% with healthy MemAvailable does NOT trip critical (the false positive that fired in initial testing).
 4. **Negative:** healthy box → guard takes no action, no alert.
 
 ## Rollout order
 
 1. Layer 1 cgroup slice (prevents recurrence; zero workflow risk).
 2. Layer 3 on-box timer (fast local recovery).
-3. Layer 2 workflow + Discord alerting (visibility).
+3. Layer 2 workflow + ntfy alerting (visibility).
 4. Trim `resource-monitor.yml` swap remediation + add load metric.
 
 ## Open questions
