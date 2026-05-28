@@ -109,3 +109,32 @@ jobs:
 
           echo "⚠️ Server did not come back after reboot — may need manual intervention"
           exit 1
+
+      - name: Report to Ownersbox
+        if: always()
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          # Push this run's outcome to the Ownersbox dashboard so JARVIS sees it
+          # (the all-important "host was rebooted" event drives a post-mortem).
+          # No-ops when the secrets aren't set — detection/reboot still ran.
+          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
+          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
+          STATUS="${{ steps.health.outputs.status }}"
+          STILL_DOWN="${{ steps.recheck.outputs.still_down }}"
+          FAILURES="${{ steps.health.outputs.failures }}"
+          TOTAL="${{ steps.health.outputs.total }}"
+          if [ "$STATUS" = "down" ] && [ "$STILL_DOWN" = "true" ]; then
+            LEVEL=critical; ACTION=reboot
+          elif [ "$STATUS" = "down" ]; then
+            LEVEL=warn; ACTION=observe
+          else
+            LEVEL=ok; ACTION=none
+          fi
+          NOW=$(date -u +%FT%TZ)
+          curl -fsS -m 10 \
+            -H "Authorization: Bearer ${OBX_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"layer\":\"health-check\",\"level\":\"${LEVEL}\",\"action\":\"${ACTION}\",\"target\":\"host\",\"reason\":\"endpoints ${FAILURES:-?}/${TOTAL:-?} unreachable\",\"reported_at\":\"${NOW}\"}" \
+            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"

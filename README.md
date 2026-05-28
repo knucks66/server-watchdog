@@ -87,3 +87,16 @@ fail-safe (Layer 3).
 | `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard | Ed25519 private key for root@server |
 | `SERVER_IP` | container-health, resource-monitor, load-guard | Server IP address |
 | `NTFY_URL` | load-guard | Full ntfy topic URL (e.g. `https://ntfy.sh/<private-topic>`) for push alerts (optional — detection/remediation run without it) |
+| `OBX_WEBHOOK_URL` | all | Ownersbox ingest endpoint `https://ownersbox.rumio.world/api/watchdog/event` (optional — feeds JARVIS) |
+| `OBX_TOKEN` | all | Ownersbox agent token (`obx_…`) for the `watchdog` agent, `event:write` scope (optional) |
+
+### Feeding the Ownersbox dashboard (JARVIS)
+
+When `OBX_WEBHOOK_URL` and `OBX_TOKEN` are set, every workflow (and the on-box
+load-guard timer) POSTs a structured event to Ownersbox so its JARVIS AI layer
+gains real-time awareness of what the watchdog detected and did — host reboots,
+container restarts, cleanups, and load-guard criticals. This is purely additive:
+detection and remediation run regardless, and Ownersbox also pulls this repo's
+GitHub Actions run status independently so it can tell when the watchdog has
+stopped running entirely. Mint the token from the Ownersbox dashboard
+(Agents → watchdog → tokens, `event:write` scope).

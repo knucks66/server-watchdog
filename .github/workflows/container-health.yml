@@ -278,3 +278,27 @@ jobs:
             echo "⚠️ Some containers did not recover — may need manual intervention"
             exit 1
           fi
+
+      - name: Report to Ownersbox
+        if: always()
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          # Mirror this run to Ownersbox/JARVIS. No-ops without the secrets.
+          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
+          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
+          NEEDS="${{ steps.check.outputs.needs_restart }}"
+          LIST="${{ steps.check.outputs.restart_list }}"
+          if [ "$NEEDS" = "true" ]; then
+            LEVEL=warn; ACTION=restart_container
+          else
+            LEVEL=ok; ACTION=none
+          fi
+          NOW=$(date -u +%FT%TZ)
+          LIST_ESC=$(printf '%s' "$LIST" | sed 's/\\/\\\\/g; s/"/\\"/g')
+          curl -fsS -m 10 \
+            -H "Authorization: Bearer ${OBX_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"layer\":\"container-health\",\"level\":\"${LEVEL}\",\"action\":\"${ACTION}\",\"target\":\"${LIST_ESC}\",\"reason\":\"restarted: ${LIST_ESC:-none}\",\"reported_at\":\"${NOW}\"}" \
+            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"

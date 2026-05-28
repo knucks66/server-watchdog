@@ -241,3 +241,29 @@ jobs:
             echo "  Removing $container..."
             $SSH "docker stop $container && docker rm $container" 2>&1 || true
           done
+
+      - name: Report to Ownersbox
+        if: always()
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          # Mirror this run to Ownersbox/JARVIS. No-ops without the secrets.
+          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
+          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
+          CLEAN="${{ steps.disk.outputs.needs_cleanup }}"
+          DPCT="${{ steps.disk.outputs.disk_pct }}"
+          ORPH="${{ steps.orphans.outputs.found_orphans }}"
+          if [ "$CLEAN" = "true" ] || [ "$ORPH" = "true" ]; then
+            LEVEL=warn; ACTION=pruned
+          else
+            LEVEL=ok; ACTION=none
+          fi
+          REASON="disk ${DPCT:-?}%"
+          [ "$ORPH" = "true" ] && REASON="${REASON}, orphans removed"
+          NOW=$(date -u +%FT%TZ)
+          curl -fsS -m 10 \
+            -H "Authorization: Bearer ${OBX_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"layer\":\"resource-monitor\",\"level\":\"${LEVEL}\",\"action\":\"${ACTION}\",\"target\":\"host\",\"reason\":\"${REASON}\",\"reported_at\":\"${NOW}\"}" \
+            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"

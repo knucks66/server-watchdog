@@ -46,6 +46,36 @@ SWAP_CRIT_PCT="${SWAP_CRIT_PCT:-90}"
 PG_CONTAINER="${PG_CONTAINER:-infrastructure-postgres-1}"
 SHED_BUILDS="${SHED_BUILDS:-0}"
 
+# Optional: mirror every RESULT to the Ownersbox dashboard so JARVIS gains
+# real-time awareness of load-guard detections/remediations (Layers 2 AND 3,
+# since both run this same engine). Detection/remediation run regardless; this
+# is purely additive and silently no-ops when the env vars are unset.
+OBX_WEBHOOK_URL="${OBX_WEBHOOK_URL:-}"
+OBX_TOKEN="${OBX_TOKEN:-}"
+
+# emit RESULTLINE — echo the machine-readable RESULT (callers parse it) and, when
+# configured, POST a structured event to Ownersbox. Best-effort; never fails.
+emit() {
+  local line="$1"
+  echo "$line"
+  [ -z "$OBX_WEBHOOK_URL" ] && return 0
+  [ -z "$OBX_TOKEN" ] && return 0
+  local lvl act rsn now raw_esc rsn_esc
+  lvl=$(printf '%s' "$line" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+  act=$(printf '%s' "$line" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+  rsn=$(printf '%s' "$line" | sed -n 's/.*reasons=\([^ ]*\).*/\1/p')
+  case "$lvl" in critical*) lvl=critical ;; warn*) lvl=warn ;; *) lvl=ok ;; esac
+  [ -z "$act" ] && act=none
+  now=$(date -u +%FT%TZ)
+  raw_esc=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  rsn_esc=$(printf '%s' "$rsn" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  curl -fsS -m 10 \
+    -H "Authorization: Bearer ${OBX_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"layer\":\"load-guard\",\"level\":\"${lvl}\",\"action\":\"${act}\",\"reason\":\"${rsn_esc}\",\"raw\":\"${raw_esc}\",\"reported_at\":\"${now}\"}" \
+    "$OBX_WEBHOOK_URL" >/dev/null 2>&1 || true
+}
+
 exec 9>"$LOCK" 2>/dev/null || { echo "RESULT action=skip reason=no-lockfile"; exit 0; }
 if ! flock -n 9; then
   echo "RESULT action=skip reason=already-running"
@@ -86,13 +116,13 @@ metrics="load1=${load1}(crit>=${LOAD_CRIT}) mem_avail=${mem_avail}MB swap=${swap
 printf '%s level=%s prev=%s %s\n' "$ts" "$level" "$prev" "$metrics" >> "$LOG" 2>/dev/null || true
 
 if [ "$level" != critical ]; then
-  echo "RESULT action=none level=$level $metrics"
+  emit "RESULT action=none level=$level $metrics"
   exit 0
 fi
 
 # Debounce: act only when critical on two consecutive samples.
 if [ "$prev" != critical ]; then
-  echo "RESULT action=observe level=critical-first-sample reasons=$reasons $metrics"
+  emit "RESULT action=observe level=critical-first-sample reasons=$reasons $metrics"
   exit 0
 fi
 
@@ -137,4 +167,4 @@ fi
 
 [ -z "$actions" ] && actions="alert_only"
 printf '%s CRITICAL action=%s reasons=%s %s\n' "$ts" "$actions" "$reasons" "$metrics" >> "$LOG" 2>/dev/null || true
-echo "RESULT action=$actions level=critical reasons=$reasons $metrics"
+emit "RESULT action=$actions level=critical reasons=$reasons $metrics"
