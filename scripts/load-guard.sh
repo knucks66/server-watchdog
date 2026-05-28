@@ -46,26 +46,45 @@ SWAP_CRIT_PCT="${SWAP_CRIT_PCT:-90}"
 PG_CONTAINER="${PG_CONTAINER:-infrastructure-postgres-1}"
 SHED_BUILDS="${SHED_BUILDS:-0}"
 
-# Optional: mirror every RESULT to the Ownersbox dashboard so JARVIS gains
-# real-time awareness of load-guard detections/remediations (Layers 2 AND 3,
-# since both run this same engine). Detection/remediation run regardless; this
-# is purely additive and silently no-ops when the env vars are unset.
+# Optional: report to the Ownersbox dashboard so JARVIS gains awareness of
+# load-guard activity (Layers 2 AND 3 share this engine). Interventions
+# (anything other than a quiet healthy run) are pushed immediately; quiet
+# healthy runs push a low-frequency *heartbeat* (action=heartbeat) at most once
+# per OBX_HEARTBEAT_SECS so JARVIS has an independent liveness signal that
+# survives GitHub deprioritizing the scheduled Layer-2 run. Purely additive and
+# silently no-ops when the env vars are unset.
 OBX_WEBHOOK_URL="${OBX_WEBHOOK_URL:-}"
 OBX_TOKEN="${OBX_TOKEN:-}"
+OBX_HEARTBEAT_SECS="${OBX_HEARTBEAT_SECS:-900}"   # 15 min
+OBX_HB_STATE=/run/load-guard.obx-heartbeat
 
-# emit RESULTLINE — echo the machine-readable RESULT (callers parse it) and, when
-# configured, POST a structured event to Ownersbox. Best-effort; never fails.
+# emit RESULTLINE — always echo the machine-readable RESULT (callers parse it);
+# then POST to Ownersbox per the intervention/heartbeat policy above. Best-effort.
 emit() {
   local line="$1"
   echo "$line"
   [ -z "$OBX_WEBHOOK_URL" ] && return 0
   [ -z "$OBX_TOKEN" ] && return 0
-  local lvl act rsn now raw_esc rsn_esc
+  local lvl act rsn now raw_esc rsn_esc intervention last now_s
   lvl=$(printf '%s' "$line" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
   act=$(printf '%s' "$line" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
   rsn=$(printf '%s' "$line" | sed -n 's/.*reasons=\([^ ]*\).*/\1/p')
   case "$lvl" in critical*) lvl=critical ;; warn*) lvl=warn ;; *) lvl=ok ;; esac
   [ -z "$act" ] && act=none
+
+  # Intervention = not a quiet healthy run. Those push immediately. A quiet
+  # healthy run pushes a heartbeat only when one is due (throttled via statefile).
+  intervention=0
+  [ "$lvl" != ok ] && intervention=1
+  case "$act" in none|observe|"") ;; *) intervention=1 ;; esac
+  if [ "$intervention" != 1 ]; then
+    last=$(cat "$OBX_HB_STATE" 2>/dev/null || echo 0); case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    now_s=$(date +%s)
+    [ $(( now_s - last )) -lt "$OBX_HEARTBEAT_SECS" ] && return 0   # heartbeat not due
+    act=heartbeat
+  fi
+  date +%s > "$OBX_HB_STATE" 2>/dev/null || true   # any push is a sign of life
+
   now=$(date -u +%FT%TZ)
   raw_esc=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
   rsn_esc=$(printf '%s' "$rsn" | sed 's/\\/\\\\/g; s/"/\\"/g')

@@ -132,6 +132,12 @@ jobs:
           else
             LEVEL=ok; ACTION=none
           fi
+          # Push interventions only; a healthy run's liveness is covered by this
+          # repo's GitHub Actions run status, which Ownersbox pulls.
+          if [ "$ACTION" = none ] && [ "$LEVEL" = ok ]; then
+            echo "no intervention (action=$ACTION level=$LEVEL) — skipping push"
+            exit 0
+          fi
           NOW=$(date -u +%FT%TZ)
           curl -fsS -m 10 \
             -H "Authorization: Bearer ${OBX_TOKEN}" \

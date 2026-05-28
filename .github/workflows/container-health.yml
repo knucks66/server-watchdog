@@ -295,6 +295,12 @@ jobs:
           else
             LEVEL=ok; ACTION=none
           fi
+          # Push interventions only; healthy-run liveness is covered by the
+          # pulled GitHub Actions run status.
+          if [ "$ACTION" = none ] && [ "$LEVEL" = ok ]; then
+            echo "no intervention (action=$ACTION level=$LEVEL) — skipping push"
+            exit 0
+          fi
           NOW=$(date -u +%FT%TZ)
           LIST_ESC=$(printf '%s' "$LIST" | sed 's/\\/\\\\/g; s/"/\\"/g')
           curl -fsS -m 10 \
