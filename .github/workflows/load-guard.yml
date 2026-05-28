@@ -64,12 +64,12 @@ jobs:
             echo "- raw: \`$RESULT\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Alert on state change (Discord)
+      - name: Alert on state change (ntfy push)
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
         run: |
-          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
-            echo "No DISCORD_WEBHOOK_URL secret — skipping alert (detection/remediation still ran)."
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "No NTFY_URL secret — skipping alert (detection/remediation still ran)."
             exit 0
           fi
           SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
@@ -79,7 +79,7 @@ jobs:
           RESULT="${{ steps.guard.outputs.result }}"
 
           # Map to a coarse alert key so we fire only on transitions, not every
-          # tick (ownersbox-style state-change dedup).
+          # tick (state-change dedup).
           case "$ACTION" in
             shed_builds*|restarted_postgres*|*restarted_postgres*) KEY="REMEDIATED" ;;
             *) case "$LEVEL" in critical*) KEY="CRITICAL" ;; *) KEY="OK" ;; esac ;;
@@ -97,14 +97,17 @@ jobs:
           # Persist the new key for next-run dedup.
           $SSH "printf '%s' '$KEY' > /run/load-guard.alerted" || true
 
-          if [ "$KEY" = "OK" ]; then
-            MSG="✅ **Load Guard recovered** — pressure cleared. \`$RESULT\`"
-          elif [ "$KEY" = "REMEDIATED" ]; then
-            MSG="🛠️ **Load Guard acted** on the Hetzner box — \`$RESULT\`"
-          else
-            MSG="⚠️ **Load Guard: critical pressure** on the Hetzner box — \`$RESULT\`"
-          fi
+          # ntfy: Title/Priority/Tags are headers; the body is the raw RESULT.
+          # https://docs.ntfy.sh/publish/
+          case "$KEY" in
+            OK)         TITLE="Load Guard recovered";        PRIO="default"; TAGS="white_check_mark" ;;
+            REMEDIATED) TITLE="Load Guard acted on the box"; PRIO="high";    TAGS="hammer_and_wrench" ;;
+            *)          TITLE="Load Guard: CRITICAL pressure"; PRIO="high";  TAGS="warning" ;;
+          esac
 
-          curl -fsS -H 'Content-Type: application/json' \
-            -d "$(printf '{"content": %s}' "$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")" \
-            "$DISCORD_WEBHOOK_URL" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"
+          curl -fsS \
+            -H "Title: ${TITLE}" \
+            -H "Priority: ${PRIO}" \
+            -H "Tags: ${TAGS}" \
+            -d "${RESULT:-load-guard state change: $KEY}" \
+            "$NTFY_URL" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"
