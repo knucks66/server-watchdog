@@ -1,0 +1,16 @@
+[Unit]
+Description=Memory & load pressure guard (sheds runaway builds, protects postgres)
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/load-guard-spec.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/load-guard.sh
+
+# Keep the guard itself tiny and high-priority so it still runs (and can shed
+# load) even while the box is thrashing — the exact moment it's needed.
+Nice=-10
+IOSchedulingClass=realtime
+MemoryMax=128M
+# Run in system.slice, NOT runners.slice — the guard must never be capped or
+# killed by the very limit it exists to enforce on the runners.
+Slice=system.slice
