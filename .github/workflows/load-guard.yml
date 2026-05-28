@@ -37,13 +37,19 @@ jobs:
 
       - name: Run guard engine on the box
         id: guard
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
         run: |
           SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
 
           # Pipe the repo's engine to the box and run it as root. Using the
           # repo copy (not the installed one) means this layer always runs the
-          # latest engine and works even if Layer 3 isn't installed.
-          OUT=$($SSH 'bash -s' < scripts/load-guard.sh 2>&1 || true)
+          # latest engine and works even if Layer 3 isn't installed. The
+          # Ownersbox push creds are prepended to the *script stream* as exports
+          # (carried over the encrypted SSH channel, never in argv / `ps`) so the
+          # engine's emit() can report this run to JARVIS.
+          OUT=$( { printf 'export OBX_WEBHOOK_URL=%q OBX_TOKEN=%q\n' "${OBX_WEBHOOK_URL:-}" "${OBX_TOKEN:-}"; cat scripts/load-guard.sh; } | $SSH 'bash -s' 2>&1 || true)
           echo "$OUT"
 
           RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
