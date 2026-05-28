@@ -95,10 +95,10 @@ fail-safe (Layer 3).
 When `OBX_WEBHOOK_URL` and `OBX_TOKEN` are set as repo secrets, every workflow
 POSTs a structured event to Ownersbox so its JARVIS AI layer gains real-time
 awareness of what the watchdog detected and did — host reboots, container
-restarts, cleanups, and load-guard criticals. (The on-box load-guard timer —
-Layer 3 — runs the same engine and will also report once those two vars are in
-its service environment, e.g. via a systemd `EnvironmentFile`; not wired by
-default.) This is purely additive:
+restarts, cleanups, and load-guard criticals. The on-box load-guard timer
+(Layer 3) reports too: pass `OBX_WEBHOOK_URL`/`OBX_TOKEN` to
+`install-load-guard.sh` and it writes them 0600 to `/etc/load-guard.env`, which
+the service loads via `EnvironmentFile`. This is purely additive:
 detection and remediation run regardless, and Ownersbox also pulls this repo's
 GitHub Actions run status independently so it can tell when the watchdog has
 stopped running entirely. Mint the token from the Ownersbox dashboard

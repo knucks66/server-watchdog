@@ -6,6 +6,12 @@ Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/load-gu
 Type=oneshot
 ExecStart=/opt/server-watchdog/load-guard.sh
 
+# Optional Ownersbox/JARVIS push creds (OBX_WEBHOOK_URL, OBX_TOKEN). The leading
+# '-' means the unit still starts if the file is absent — the engine's emit()
+# simply no-ops the push. Written 0600 by install-load-guard.sh when those vars
+# are in the installer's environment.
+EnvironmentFile=-/etc/load-guard.env
+
 # Keep the guard itself tiny and high-priority so it still runs (and can shed
 # load) even while the box is thrashing — the exact moment it's needed.
 Nice=-10
