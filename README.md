@@ -40,6 +40,22 @@ Runs every **2 hours**. SSHes into the server and monitors resource usage.
 - Container memory/CPU usage (top 10)
 - Orphan containers (from deleted/moved compose files) — auto-removes them
 
+## Runner memory cap (cgroup slice)
+
+The self-hosted GitHub Actions runners share the production box. Without a
+limit, a runaway build (e.g. a many-way parallel `vite build` matrix) can eat
+all RAM + swap and OOM-kill production services — this caused a fleet-wide
+outage on 2026-05-28.
+
+`scripts/apply-runner-cgroup-limits.sh` puts every `actions.runner.*` unit in a
+shared `runners.slice` with a hard `MemoryMax`, so runner builds can never
+exceed their budget and starve prod. Idempotent; run as root on the server.
+Busy runners are skipped (so in-flight CI isn't killed) and adopt the slice on
+their next restart — re-run when they're idle. See
+[`docs/load-guard-spec.md`](docs/load-guard-spec.md) for the full design
+(Layer 1), plus the planned detection/remediation workflow (Layer 2) and on-box
+fail-safe (Layer 3).
+
 ## Required secrets
 
 | Secret | Used by | Description |
