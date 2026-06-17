@@ -62,6 +62,36 @@ The same engine runs on-box every **2 minutes** via a systemd timer (Layer 3,
 deprioritizes the scheduled run under load. The two cadences coordinate via a
 flock + statefile. Alerting is ntfy push, state-change-deduplicated.
 
+### 5. Logind Reaper (`logind-reaper.yml`)
+
+Runs every **30 minutes**. Runs the shared reaper engine
+(`scripts/logind-reaper.sh`) on the box and sends ntfy push alerts on state
+changes.
+
+**The problem it fixes:** `systemd-logind` (systemd 255) leaks sessions stuck in
+`State=closing` with `Leader=0` — the leader process is dead but logind never
+reaps them, and each holds a `pidfd`. They accumulate until logind hits **8,192
+open fds = the login ceiling**, after which new SSH logins / `docker exec` start
+failing. Not fixable by upgrade (already on the latest noble patch), not a CI
+mistake (the leak is host-wide — the oldest observed straggler was a residential
+SSH stuck 73 days), and ownersbox's system-wide `fd_exhaustion` alert can't see
+it (one process hoarding 8k fds barely moves the box-wide ratio).
+
+**What it checks:** logind's open fd count (the direct danger metric) and the
+count of sessions stuck `closing` + `Leader=0` (the leaked ones).
+
+**Remediation (only past threshold, at most once per run, cooldown-guarded):**
+- **Surgical first:** `loginctl terminate-session` each leaked id (only ever
+  `closing`+`Leader=0` — never a live session).
+- **Reliable fallback / primary past a higher threshold:** `systemctl restart
+  systemd-logind` — proven safe on this host (active SSH survives, containers
+  untouched, fds 8,213 → 21).
+
+The same engine runs on-box every **15 minutes** via a systemd timer (Layer 3,
+`scripts/install-logind-reaper.sh`) — costs no SSH login and is the only path
+that still works if fds ever approached the ceiling and started refusing logins.
+See [`docs/logind-reaper-spec.md`](docs/logind-reaper-spec.md).
+
 ## Runner memory cap (cgroup slice)
 
 The self-hosted GitHub Actions runners share the production box. Without a
@@ -84,9 +114,9 @@ fail-safe (Layer 3).
 |--------|---------|-------------|
 | `HETZNER_API_TOKEN` | health-check | Hetzner Cloud API token (read/write) |
 | `HETZNER_SERVER_ID` | health-check | Hetzner server ID |
-| `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard | Ed25519 private key for root@server |
-| `SERVER_IP` | container-health, resource-monitor, load-guard | Server IP address |
-| `NTFY_URL` | load-guard | Full ntfy topic URL (e.g. `https://ntfy.sh/<private-topic>`) for push alerts (optional — detection/remediation run without it) |
+| `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard, logind-reaper | Ed25519 private key for root@server |
+| `SERVER_IP` | container-health, resource-monitor, load-guard, logind-reaper | Server IP address |
+| `NTFY_URL` | load-guard, logind-reaper | Full ntfy topic URL (e.g. `https://ntfy.sh/<private-topic>`) for push alerts (optional — detection/remediation run without it) |
 | `OBX_WEBHOOK_URL` | all | Ownersbox ingest endpoint `https://ownersbox.rumio.world/api/watchdog/event` (optional — feeds JARVIS) |
 | `OBX_TOKEN` | all | Ownersbox agent token (`obx_…`) for the `watchdog` agent, `event:write` scope (optional) |
 
@@ -107,3 +137,9 @@ The on-box load-guard timer (Layer 3) reports too: pass
 to `/etc/load-guard.env`, which the service loads via `EnvironmentFile`. This is
 purely additive — detection and remediation run regardless. Mint the token from
 the Ownersbox dashboard (Agents → watchdog → tokens, `event:write` scope).
+
+The on-box logind-reaper timer works the same way via
+`install-logind-reaper.sh`. It loads **both** `/etc/load-guard.env` and an
+optional reaper-specific `/etc/logind-reaper.env`, so if load-guard is already
+installed with creds, the reaper inherits them automatically — no need to
+re-enter the token.

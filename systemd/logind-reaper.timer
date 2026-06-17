@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the systemd-logind leaked-session reaper every 15 minutes
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/logind-reaper-spec.md
+
+[Timer]
+# Slow cadence on purpose: the leak takes ~75 days to fill the 8192 fd ceiling
+# and the act threshold (FD_ACT=2000) leaves weeks of headroom, so 15 min is
+# plenty. This on-box path costs no SSH login (unlike Layer 2) and survives the
+# box being unreachable from GitHub — it's the path that still works even if fds
+# ever did approach the ceiling and started refusing new logins.
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

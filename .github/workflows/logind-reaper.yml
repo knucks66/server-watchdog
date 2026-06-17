@@ -1,0 +1,127 @@
+name: Logind Reaper
+
+# Layer 2 of the systemd-logind leaked-session reaper (docs/logind-reaper-spec.md).
+# Runs the reaper engine on the box every 30 minutes and raises ntfy alerts on
+# state changes. The engine itself (detect fd buildup -> surgical
+# terminate-session -> restart systemd-logind, cooldown-guarded) is shared with
+# Layer 3's on-box 15-minute timer; a flock + cooldown statefile keep the two
+# cadences coordinated. This workflow is the cloud-visible cadence + alerting +
+# backstop for when the on-box timer is missing.
+#
+# Cadence is deliberately slow: the leak takes ~75 days to fill the 8192 fd
+# ceiling and the FD_ACT=2000 threshold leaves weeks of headroom, so 30 min is
+# ample — and each run is an SSH login, the very thing that (rarely) seeds the
+# leak, so we don't churn logins needlessly. Layer 3 supplies the finer cadence
+# with no login cost.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:
+
+# Don't pile up runs if one is slow (e.g. SSH hangs).
+concurrency:
+  group: logind-reaper
+  cancel-in-progress: false
+
+jobs:
+  logind-reaper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY / SERVER_IP and fail2ban"
+            exit 1
+          fi
+          echo "✅ SSH connectivity verified"
+
+      - name: Run reaper engine on the box
+        id: reaper
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
+
+          # Pipe the repo's engine to the box and run it as root. Using the repo
+          # copy (not the installed one) means this layer always runs the latest
+          # engine and works even if Layer 3 isn't installed. The Ownersbox push
+          # creds are prepended to the *script stream* as exports (carried over
+          # the encrypted SSH channel, never in argv / `ps`) so the engine's
+          # emit() can report a reap to JARVIS.
+          OUT=$( { printf 'export OBX_WEBHOOK_URL=%q OBX_TOKEN=%q\n' "${OBX_WEBHOOK_URL:-}" "${OBX_TOKEN:-}"; cat scripts/logind-reaper.sh; } | $SSH 'bash -s' 2>&1 || true)
+          echo "$OUT"
+
+          RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
+          LEVEL=$(printf '%s' "$RESULT" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+          ACTION=$(printf '%s' "$RESULT" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+          [ -z "$LEVEL" ] && LEVEL=unknown
+          [ -z "$ACTION" ] && ACTION=unknown
+
+          echo "level=$LEVEL"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Logind Reaper"
+            echo ""
+            echo "- level: \`$LEVEL\`"
+            echo "- action: \`$ACTION\`"
+            echo "- raw: \`$RESULT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alert on state change (ntfy push)
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+        run: |
+          if [ -z "${NTFY_URL:-}" ]; then
+            echo "No NTFY_URL secret — skipping alert (detection/remediation still ran)."
+            exit 0
+          fi
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          LEVEL="${{ steps.reaper.outputs.level }}"
+          ACTION="${{ steps.reaper.outputs.action }}"
+          RESULT="${{ steps.reaper.outputs.result }}"
+
+          # Map to a coarse alert key so we fire only on transitions, not every
+          # tick (state-change dedup).
+          case "$ACTION" in
+            terminate_sessions*|restarted_logind*) KEY="REAPED" ;;
+            *) case "$LEVEL" in critical*) KEY="CRITICAL" ;; warn*) KEY="WARN" ;; *) KEY="OK" ;; esac ;;
+          esac
+
+          PREV=$($SSH "cat /run/logind-reaper.alerted 2>/dev/null" || echo "OK")
+          PREV=${PREV:-OK}
+          echo "alert key: prev=$PREV now=$KEY"
+
+          if [ "$KEY" = "$PREV" ]; then
+            echo "No state change ($KEY) — no alert."
+            exit 0
+          fi
+
+          # Persist the new key for next-run dedup.
+          $SSH "printf '%s' '$KEY' > /run/logind-reaper.alerted" || true
+
+          # ntfy: Title/Priority/Tags are headers; the body is the raw RESULT.
+          # https://docs.ntfy.sh/publish/
+          case "$KEY" in
+            OK)        TITLE="Logind Reaper recovered";          PRIO="default"; TAGS="white_check_mark" ;;
+            REAPED)    TITLE="Logind Reaper cleared leaked sessions"; PRIO="high"; TAGS="hammer_and_wrench" ;;
+            WARN)      TITLE="Logind fds elevated";              PRIO="default"; TAGS="warning" ;;
+            *)         TITLE="Logind Reaper: CRITICAL fd buildup"; PRIO="high";  TAGS="warning" ;;
+          esac
+
+          curl -fsS \
+            -H "Title: ${TITLE}" \
+            -H "Priority: ${PRIO}" \
+            -H "Tags: ${TAGS}" \
+            -d "${RESULT:-logind-reaper state change: $KEY}" \
+            "$NTFY_URL" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"

@@ -1,0 +1,20 @@
+[Unit]
+Description=Reap systemd-logind leaked sessions (closing + Leader=0) before the 8192 fd ceiling
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/logind-reaper-spec.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/logind-reaper.sh
+
+# Optional Ownersbox/JARVIS push creds (OBX_WEBHOOK_URL, OBX_TOKEN). Both files
+# are optional (leading '-'): the reaper inherits the shared load-guard creds if
+# present, and a reaper-specific file overrides them (later EnvironmentFile
+# wins). With neither, the engine's emit() simply no-ops the push.
+EnvironmentFile=-/etc/load-guard.env
+EnvironmentFile=-/etc/logind-reaper.env
+
+# Run in system.slice, NOT runners.slice — the reaper must never be capped or
+# killed by the runner memory limit. It's tiny; a modest priority bump is enough.
+Nice=-5
+MemoryMax=64M
+Slice=system.slice
