@@ -57,3 +57,5 @@ endpoints:
     url: https://api.slotlandia.rumio.world/health
   - name: The Juliet
     url: https://api.the-juliet-detroit.rumio.world/health
+  - name: DripT Agent
+    url: https://api.dript-agent.rumio.world/health
