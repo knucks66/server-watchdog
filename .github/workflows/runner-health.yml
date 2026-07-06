@@ -1,0 +1,69 @@
+name: Runner Health Check
+
+# Layer 2 of the Runner Guard. Runs the shared engine on the box every 10
+# minutes and reports state. The same engine runs on-box every 2 minutes
+# via systemd timer (Layer 3); a flock serializes the two cadences.
+#
+# This workflow is the cloud-visible cadence — supplementary to Layer 3.
+# Layer 3 is the primary recovery path because it doesn't depend on any
+# runner being online. This workflow gives a second opinion and catches
+# cases where systemd itself is struggling.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes
+  workflow_dispatch:
+
+concurrency:
+  group: runner-health
+  cancel-in-progress: false
+
+jobs:
+  runner-health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' '${{ secrets.SSH_PRIVATE_KEY }}' | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes \
+                   -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "SSH auth failed"
+            exit 1
+          fi
+          echo "SSH connectivity verified"
+
+      - name: Run runner guard on the box
+        id: guard
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes \
+               -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
+
+          OUT=$( { printf 'export OBX_WEBHOOK_URL=%q OBX_TOKEN=%q\n' "${OBX_WEBHOOK_URL:-}" "${OBX_TOKEN:-}"; \
+                   cat scripts/runner-guard.sh; } | $SSH 'bash -s' 2>&1 || true )
+          echo "$OUT"
+
+          RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
+          LEVEL=$(printf '%s' "$RESULT" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+          ACTION=$(printf '%s' "$RESULT" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+          [ -z "$LEVEL" ] && LEVEL=unknown
+          [ -z "$ACTION" ] && ACTION=unknown
+
+          echo "level=$LEVEL"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Runner Health"
+            echo ""
+            echo "- level: \`$LEVEL\`"
+            echo "- action: \`$ACTION\`"
+            echo "- raw: \`$RESULT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
