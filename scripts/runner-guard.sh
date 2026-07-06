@@ -95,7 +95,7 @@ write_cooldown() {
 # --- Discover all actions.runner.* units ---
 mapfile -t UNITS < <(
   systemctl list-units 'actions.runner.*' --all --no-legend --plain 2>/dev/null \
-    | awk '{print $1, $2}'   # unit name + active state
+    | awk '{print $1, $3}'   # unit name + ACTIVE state (col 3; col 2 is LOAD)
 )
 
 if [ "${#UNITS[@]}" -eq 0 ]; then
