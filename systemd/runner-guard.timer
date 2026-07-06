@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the runner guard every 2 minutes
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/runner-guard-spec.md
+
+[Timer]
+# Fast local cadence — this is the primary Layer 3 fail-safe that survives
+# GitHub being unreachable. Runner restarts are lightweight (seconds) and
+# the per-runner cooldown prevents restart loops. Matches the load-guard
+# cadence for consistency.
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

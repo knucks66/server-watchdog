@@ -1,0 +1,18 @@
+[Unit]
+Description=Self-hosted GitHub Actions runner guard (restart failed runners)
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/docs/runner-guard-spec.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/runner-guard.sh
+
+# Inherit Ownersbox push creds from the shared load-guard.env, plus a
+# runner-guard-specific override file for finer control. Both are optional
+# (leading '-' means missing file is not an error).
+EnvironmentFile=-/etc/load-guard.env
+EnvironmentFile=-/etc/runner-guard.env
+
+# Keep the guard tiny and high-priority so it still runs under pressure.
+Nice=-5
+MemoryMax=64M
+Slice=system.slice
