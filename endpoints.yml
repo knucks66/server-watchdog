@@ -59,3 +59,5 @@ endpoints:
     url: https://api.the-juliet-detroit.rumio.world/health
   - name: DripT Agent
     url: https://api.dript-agent.rumio.world/health
+  - name: NeuroApparatus
+    url: https://api.neuroapparatus.rumio.world/health
