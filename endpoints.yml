@@ -63,3 +63,5 @@ endpoints:
     url: https://api.neuroapparatus.rumio.world/health
   - name: Bnb supply closet
     url: https://api.bnb-supply-closet.rumio.world/health
+  - name: Air Cleared
+    url: https://api.aircleared.com/health
