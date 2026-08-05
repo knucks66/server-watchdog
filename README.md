@@ -33,7 +33,8 @@ Runs every **10 minutes**. SSHes into the server and checks container-level heal
 Runs every **2 hours**. SSHes into the server and monitors resource usage.
 
 **What it checks:**
-- Disk usage (auto-cleanup at >=85%: prunes images, build cache, unused volumes)
+- Disk usage (auto-cleanup at >=85%: prunes images, build cache, and
+  **anonymous** volumes only — named volumes are reported, never deleted)
 - RAM and swap usage (warns when critically low, drops caches at >=95% swap)
 - Zombie processes (auto-restarts parent containers when >100 zombies detected)
 - Docker resource breakdown (images, containers, volumes, build cache)
@@ -91,6 +92,50 @@ The same engine runs on-box every **15 minutes** via a systemd timer (Layer 3,
 `scripts/install-logind-reaper.sh`) — costs no SSH login and is the only path
 that still works if fds ever approached the ceiling and started refusing logins.
 See [`docs/logind-reaper-spec.md`](docs/logind-reaper-spec.md).
+
+### 6. Kernel Reboot (`kernel-reboot.yml`)
+
+Runs **weekly, Sundays 05:00 UTC**. Reboots the box onto a pending kernel, but
+only when it is genuinely safe to do so.
+
+**The problem it fixes:** `unattended-upgrades` is installed and enabled, and it
+faithfully *installs* security updates including kernels — but it has no
+`Automatic-Reboot` setting, so nothing ever activates them. On 2026-08-05 the box
+had been up **17 weeks** running `6.8.0-106` with `6.8.0-136` installed and
+`/var/run/reboot-required` set: 30 kernel versions plus a `libc6` update sitting
+dormant. Security patches you have downloaded but never booted are not applied.
+
+**Why not just set `Unattended-Upgrade::Automatic-Reboot "true"`:** a blind
+reboot at a fixed hour would kill in-flight CI across the 21 self-hosted runners
+(the 3-shard suite runs 1-2h), and can land inside the 03:00-03:20 nightly backup
+window — the `vigil_app` dump alone is ~4.5 GB and takes most of it.
+
+**Guards (all must pass; any failure postpones to next week and exits 0):**
+- `/var/run/reboot-required` exists — otherwise there is nothing to do
+- no `Runner.Worker` processes (no CI job in flight)
+- no `pg_dump` / backup script running
+- no `docker build` / `docker compose up` (no deploy mid-recreate)
+- no failed systemd units — never reboot on top of an existing fault
+
+**Sequence:** stop runners → `docker compose stop` (graceful Postgres; never
+`down --remove-orphans`, which reaps docker-run containers including Postgres) →
+Hetzner API soft reboot → wait for SSH → `compose start` → `docker start
+pg-ci-proxy` (the one container with restart policy `no`) → restart runners →
+verify container count, swap, and every endpoint in `endpoints.yml`.
+
+`workflow_dispatch` accepts `force: true` to override the idle guards (still
+requires a pending reboot) for a deliberate manual window.
+
+> **Counting convention in the guards.** Patterns are written `[R]unner.Worker`,
+> `[p]g_dump` and counted with `| wc -l`. Both halves are load-bearing: without
+> the bracket, `pgrep -f 'pg_dump'` matches the SSH command line *asking the
+> question*, so the backup guard reports a backup running 24/7 and the reboot is
+> postponed forever. And `grep -c`/`pgrep -c` exit non-zero on no-match, so the
+> natural `$(... || echo 0)` emits **two** lines (`0
+0`) — which compares as
+> non-zero and trips the guard it was meant to clear. Both bugs were caught by
+> dry-running the guards against the live box; both fail *closed* (never reboot),
+> which is why they would have gone unnoticed indefinitely.
 
 ## Runner memory cap (cgroup slice)
 

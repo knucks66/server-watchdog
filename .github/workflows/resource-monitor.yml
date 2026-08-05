@@ -220,10 +220,37 @@ jobs:
           echo "Pruning build cache..."
           $SSH "docker builder prune -f --keep-storage=2GB" 2>/dev/null | tail -1 || true
 
-          # Remove unused volumes
+          # Remove unused volumes — ANONYMOUS ONLY.
+          #
+          # `docker volume prune -f` deletes every unreferenced volume, including
+          # NAMED ones. Named volumes are data somebody deliberately created and
+          # a detached one is usually a service that's temporarily down or was
+          # moved between compose files — not garbage. On 2026-08-05 the box had
+          # 133 unreferenced volumes, and five of them were named, including
+          # `podcastwiz_postgres-data` (a live Postgres data directory). Disk was
+          # at 81%; had it crossed the 85% threshold this step would have
+          # destroyed that database with no prompt and no backup step.
+          #
+          # Anonymous volumes are 64-char hex IDs that Docker creates for
+          # unnamed VOLUME directives and abandons on every container recreate.
+          # Those are the actual churn (128 of the 133) and are safe to drop.
+          # Anything with a human-readable name is left for a human.
           echo ""
-          echo "Pruning unused volumes..."
-          $SSH "docker volume prune -f" 2>/dev/null | tail -1 || true
+          echo "Pruning ANONYMOUS unused volumes (named volumes are never auto-deleted)..."
+          ANON=$($SSH "docker volume ls -qf dangling=true | grep -E '^[0-9a-f]{64}\$' | wc -l" 2>/dev/null || echo 0)
+          echo "  anonymous dangling volumes: $ANON"
+          if [ "${ANON:-0}" -gt 0 ]; then
+            $SSH "docker volume ls -qf dangling=true | grep -E '^[0-9a-f]{64}\$' | xargs -r docker volume rm" 2>/dev/null | tail -1 || true
+          fi
+
+          # Surface named orphans so they get a human decision instead of being
+          # silently deleted or silently ignored.
+          NAMED=$($SSH "docker volume ls -qf dangling=true | grep -vE '^[0-9a-f]{64}\$'" 2>/dev/null || true)
+          if [ -n "$NAMED" ]; then
+            echo ""
+            echo "⚠️  Named volumes are unreferenced but were NOT deleted (review manually):"
+            echo "$NAMED" | sed 's/^/    /'
+          fi
 
           # Report new disk usage
           echo ""
