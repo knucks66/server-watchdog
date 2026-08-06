@@ -1,0 +1,321 @@
+name: Kernel Reboot (guarded)
+
+# `unattended-upgrades` installs security updates including kernels, but it has
+# no Automatic-Reboot setting, so nothing ever activates them. On 2026-08-05 the
+# box had been up 17 weeks running 6.8.0-106 with 6.8.0-136 installed and
+# /var/run/reboot-required set — 30 kernel versions and a libc6 update sitting
+# dormant.
+#
+# The fix is NOT `Unattended-Upgrade::Automatic-Reboot "true"`. A blind reboot at
+# a fixed hour would kill in-flight CI on 21 self-hosted runners and can land
+# inside the 03:00-03:20 nightly backup window (the vigil_app dump alone is
+# ~4.5 GB and takes most of it). This workflow does the same job with the
+# preconditions a human would check, and drains the box the way the manual
+# runbook does.
+#
+# Deliberately conservative: every guard failure SKIPS the reboot and exits 0.
+# A postponed kernel update is a non-event; a reboot into a running deploy or a
+# half-written backup is not. It runs weekly, so a skip just tries again in 7
+# days.
+
+on:
+  schedule:
+    # Sundays 05:00 UTC — well clear of the 03:00-03:20 backup window, and the
+    # quietest point in the CI week.
+    - cron: '0 5 * * 0'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Skip the idle/backup guards (still requires reboot-required)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: kernel-reboot
+  cancel-in-progress: false
+
+jobs:
+  kernel-reboot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          # Strip any CRLF from the secret (common cause of "error in libcrypto"
+          # when the key was pasted from a Windows clipboard).
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+          if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY and that the runner IP is not fail2ban'd"
+            exit 1
+          fi
+          echo "✅ SSH connectivity verified"
+
+      - name: Check whether a reboot is actually pending
+        id: pending
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          REQUIRED=$($SSH "[ -f /var/run/reboot-required ] && echo yes || echo no" 2>/dev/null || echo "unknown")
+          RUNNING=$($SSH "uname -r" 2>/dev/null || echo "?")
+          LATEST=$($SSH "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1" 2>/dev/null || echo "?")
+          UPTIME=$($SSH "uptime -p" 2>/dev/null || echo "?")
+
+          echo "reboot-required : $REQUIRED"
+          echo "running kernel  : $RUNNING"
+          echo "latest installed: $LATEST"
+          echo "uptime          : $UPTIME"
+
+          {
+            echo "required=$REQUIRED"
+            echo "running=$RUNNING"
+            echo "latest=$LATEST"
+            echo "uptime=$UPTIME"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$REQUIRED" != "yes" ]; then
+            echo "✅ No reboot pending — nothing to do."
+          fi
+
+      - name: Verify it is safe to reboot right now
+        id: guards
+        if: steps.pending.outputs.required == 'yes'
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          BLOCKERS=""
+
+          # Counting convention, load-bearing in two ways:
+          #
+          #   [x]pattern — the bracket makes the pattern match "xpattern" while
+          #   the literal text "[x]pattern" in our own command line does NOT
+          #   match it. Without this, `pgrep -f 'pg_dump'` matches the very SSH
+          #   invocation asking the question, so the backup guard reports a
+          #   backup running 24/7 and the reboot is postponed forever — an
+          #   automation that never fires and never complains.
+          #
+          #   | wc -l — always exits 0 and prints exactly one number. `grep -c`
+          #   and `pgrep -c` exit non-zero on no-match, so the natural
+          #   `$(... || echo 0)` emits TWO lines ("0\n0"), which is != "0" and
+          #   trips the very guard it was meant to clear.
+          count_matching() { $SSH "ps -eo args | grep '$1' | wc -l" 2>/dev/null || echo 0; }
+
+          # 1. CI. A reboot mid-job fails the run, and the 3-shard suite is 1-2h,
+          #    so the cost of interrupting is high and the cost of waiting is a week.
+          JOBS=$(count_matching '[R]unner.Worker')
+          echo "active CI jobs: $JOBS"
+          [ "${JOBS:-0}" != "0" ] && BLOCKERS="$BLOCKERS ci($JOBS)"
+
+          # 2. Backups. Rebooting mid-dump leaves a truncated archive that still
+          #    looks like a valid .gz until you try to restore it.
+          BACKUP_RUNNING=$(count_matching '[b]ackup-postgres\|[p]g_dump')
+          echo "backup processes: $BACKUP_RUNNING"
+          [ "${BACKUP_RUNNING:-0}" != "0" ] && BLOCKERS="$BLOCKERS backup"
+
+          # 3. Deploys. A tenant container mid-recreate must not lose its host.
+          DEPLOYING=$(count_matching '[d]ocker build\|[d]ocker compose up\|[d]ocker compose build')
+          echo "deploy processes: $DEPLOYING"
+          [ "${DEPLOYING:-0}" != "0" ] && BLOCKERS="$BLOCKERS deploy"
+
+          # 4. Anything already broken. Rebooting on top of an existing failure
+          #    turns one problem into two and makes the cause ambiguous.
+          #    run-u*.service are transient systemd-run one-shots, not real units.
+          FAILED=$($SSH "systemctl list-units --failed --no-legend --plain 2>/dev/null | grep -v '^run-u[0-9]*\.service' | wc -l" 2>/dev/null || echo 0)
+          echo "failed systemd units (excluding transient run-u*): $FAILED"
+          [ "${FAILED:-0}" != "0" ] && BLOCKERS="$BLOCKERS failed-units($FAILED)"
+
+          if [ -n "$BLOCKERS" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo "blockers=$BLOCKERS" >> "$GITHUB_OUTPUT"
+            echo "⏭️  Postponing reboot —$BLOCKERS. Retries on the next scheduled run."
+          else
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            [ -n "$BLOCKERS" ] && echo "⚠️  force=true — overriding:$BLOCKERS"
+            echo "✅ Safe to reboot"
+          fi
+
+      - name: Drain the box
+        id: drain
+        if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          # runner-guard.timer fires every 2 MINUTES and restarts any inactive
+          # runner — that is its whole job. Stopping the runners without stopping
+          # the guard first is useless: observed live on 2026-08-05, the guard
+          # restarted all 19 runners ONE SECOND after they were stopped
+          # (`action=restarted(19/19)`), and one of them could then pick up a
+          # queued job moments before the power-off. Guard first, runners second.
+          echo "Stopping runner-guard timer (it would resurrect the runners in <2min)..."
+          $SSH "systemctl stop runner-guard.timer" 2>/dev/null || true
+          echo "drained=true" >> "$GITHUB_OUTPUT"
+
+          echo "Stopping self-hosted runners..."
+          $SSH "systemctl stop 'actions.runner.*'" 2>/dev/null || true
+
+          # Confirm they stayed down rather than assuming — if the guard is still
+          # somehow active this is where we find out, before the power-off.
+          sleep 15
+          STILL_UP=$($SSH "systemctl list-units 'actions.runner.*' --state=active --no-legend --plain 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+          echo "runners still active after 15s: $STILL_UP"
+          if [ "${STILL_UP:-0}" != "0" ]; then
+            echo "❌ Runners came back — something is re-starting them. Aborting before power-off."
+            exit 1
+          fi
+
+          # Apps BEFORE infrastructure. 47 of the 49 containers belong to 15
+          # different compose projects; only 8 are in `infrastructure`. Running
+          # just the infrastructure stop pulls Postgres out from under ~39 live
+          # tenant apps, which is how you get WAL replay on the next boot.
+          echo "Stopping app containers (all projects except infrastructure)..."
+          $SSH "docker ps --format '{{.Names}}|{{.Label \"com.docker.compose.project\"}}' | awk -F'|' '\$2!=\"infrastructure\"{print \$1}' | xargs -r docker stop -t 30" >/dev/null 2>&1 || true
+
+          # `stop`, never `down --remove-orphans` — that reaps docker-run
+          # containers on this box, Postgres among them.
+          echo "Stopping infrastructure containers (graceful Postgres shutdown)..."
+          $SSH "cd /opt/infrastructure && docker compose stop -t 60" 2>/dev/null || true
+          sleep 5
+
+          LEFT=$($SSH "docker ps -q | wc -l" 2>/dev/null || echo "?")
+          echo "containers still running: $LEFT"
+
+      - name: Reboot via Hetzner API
+        if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
+        run: |
+          echo "🔄 Sending soft reboot request to Hetzner..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.hetzner.cloud/v1/servers/${{ secrets.HETZNER_SERVER_ID }}/actions/reboot" \
+            -H "Authorization: Bearer ${{ secrets.HETZNER_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "Hetzner API response: HTTP $HTTP_CODE"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Reboot initiated"
+          else
+            echo "❌ Reboot request failed"
+            exit 1
+          fi
+
+      - name: Wait for the box and bring back what does not self-start
+        id: verify
+        if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
+        run: |
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+
+          echo "Waiting for SSH..."
+          UP=false
+          for i in $(seq 1 20); do
+            sleep 30
+            if $SSH "true" 2>/dev/null; then UP=true; echo "✅ SSH back after ~$((i*30))s"; break; fi
+            echo "  attempt $i: not yet"
+          done
+          if [ "$UP" != "true" ]; then
+            echo "❌ Server did not return after reboot — manual intervention needed"
+            echo "recovered=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          NEW_KERNEL=$($SSH "uname -r" 2>/dev/null || echo "?")
+          echo "kernel now: $NEW_KERNEL (was ${{ steps.pending.outputs.running }})"
+          echo "kernel=$NEW_KERNEL" >> "$GITHUB_OUTPUT"
+
+          # Docker restart policies bring back 48 of the 49 containers on their
+          # own, and both the runner units and runner-guard.timer are `enabled`
+          # so systemd starts them at boot. These calls are belt-and-braces for
+          # the stragglers — cheap, idempotent, and they turn "probably fine"
+          # into something verified below.
+          echo "Starting infrastructure stack..."
+          $SSH "cd /opt/infrastructure && docker compose start" 2>/dev/null || true
+
+          # pg-ci-proxy is the one container with restart policy 'no'.
+          $SSH "docker start pg-ci-proxy" 2>/dev/null || true
+
+          $SSH "systemctl start 'actions.runner.*'" 2>/dev/null || true
+          # The guard was stopped during the drain. It is enabled so it returns
+          # on boot, but assert it rather than trust it — a masked guard means
+          # nothing heals a dead runner until someone notices by hand.
+          $SSH "systemctl start runner-guard.timer" 2>/dev/null || true
+
+          sleep 20
+          RUNNING=$($SSH "docker ps -q | wc -l" 2>/dev/null || echo 0)
+          NOTUP=$($SSH "docker ps -a --filter status=exited --filter status=restarting --format '{{.Names}}'" 2>/dev/null || true)
+          echo "containers running: $RUNNING"
+          echo "containers=$RUNNING" >> "$GITHUB_OUTPUT"
+          if [ -n "$NOTUP" ]; then
+            echo "⚠️ Not running:"; echo "$NOTUP" | sed 's/^/    /'
+          fi
+
+          echo -n "runners active: ";      $SSH "systemctl list-units 'actions.runner.*' --state=active --no-legend --plain 2>/dev/null | wc -l" 2>/dev/null || echo "?"
+          echo -n "runner-guard timer: ";  $SSH "systemctl is-active runner-guard.timer" 2>/dev/null || echo "?"
+
+          # Swap lives in /etc/fstab; confirm it actually came back — a box that
+          # boots without swap looks fine until the first memory spike.
+          $SSH "swapon --show" 2>/dev/null || echo "⚠️ no swap active"
+
+      - name: Verify endpoints are serving
+        if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
+        run: |
+          ENDPOINTS=$(grep '^\s*url:' endpoints.yml | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'")
+          FAIL=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "$url" 2>/dev/null || echo "000")
+            echo "  $url → HTTP $CODE"
+            [ "$CODE" = "000" ] && FAIL=$((FAIL + 1))
+          done <<< "$ENDPOINTS"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo "❌ $FAIL endpoint(s) unreachable after reboot"
+            exit 1
+          fi
+          echo "✅ All endpoints serving"
+
+      - name: Undrain if we drained but never rebooted
+        if: failure() && steps.drain.outputs.drained == 'true'
+        run: |
+          # Reached only when something between the drain and a verified boot
+          # failed — a rejected Hetzner API call, a box that never came back.
+          # Without this the server is left with every container down, the
+          # runners stopped, and runner-guard MASKED, so the guard can't even
+          # self-heal it. Best-effort: the box may be unreachable, in which case
+          # the alert below is the signal.
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          echo "⚠️  Drain happened but the reboot did not verify — attempting to restore service."
+          $SSH "cd /opt/infrastructure && docker compose start" 2>/dev/null || echo "  (could not start infrastructure — box may be down)"
+          $SSH "docker start pg-ci-proxy" 2>/dev/null || true
+          $SSH "systemctl start 'actions.runner.*'" 2>/dev/null || true
+          # Unmask the guard LAST so it doesn't race the explicit start above.
+          $SSH "systemctl start runner-guard.timer" 2>/dev/null || echo "  (could not restart runner-guard.timer — RESTART IT MANUALLY)"
+          echo "Restore attempted — verify manually before trusting it."
+
+      - name: Report to Ownersbox/JARVIS
+        if: always()
+        env:
+          OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
+          OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
+        run: |
+          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
+          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
+
+          REQUIRED="${{ steps.pending.outputs.required }}"
+          SAFE="${{ steps.guards.outputs.safe }}"
+          if [ "$REQUIRED" != "yes" ]; then
+            LEVEL=ok; ACTION=none; MSG="No kernel reboot pending (${{ steps.pending.outputs.running }}, up ${{ steps.pending.outputs.uptime }})"
+          elif [ "$SAFE" != "true" ]; then
+            LEVEL=warn; ACTION=postponed; MSG="Kernel reboot postponed —${{ steps.guards.outputs.blockers }}"
+          elif [ "${{ job.status }}" = "success" ]; then
+            LEVEL=ok; ACTION=rebooted; MSG="Rebooted onto ${{ steps.verify.outputs.kernel }} (was ${{ steps.pending.outputs.running }}), ${{ steps.verify.outputs.containers }} containers up"
+          else
+            LEVEL=error; ACTION=failed; MSG="Kernel reboot FAILED — check the run"
+          fi
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OBX_TOKEN" \
+            -d "{\"source\":\"kernel-reboot\",\"level\":\"$LEVEL\",\"action\":\"$ACTION\",\"message\":\"$MSG\"}" \
+            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"
