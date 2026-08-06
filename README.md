@@ -117,11 +117,26 @@ window — the `vigil_app` dump alone is ~4.5 GB and takes most of it.
 - no `docker build` / `docker compose up` (no deploy mid-recreate)
 - no failed systemd units — never reboot on top of an existing fault
 
-**Sequence:** stop runners → `docker compose stop` (graceful Postgres; never
-`down --remove-orphans`, which reaps docker-run containers including Postgres) →
-Hetzner API soft reboot → wait for SSH → `compose start` → `docker start
-pg-ci-proxy` (the one container with restart policy `no`) → restart runners →
-verify container count, swap, and every endpoint in `endpoints.yml`.
+**Sequence:** stop `runner-guard.timer` → stop runners (and *verify* they stayed
+down) → stop app containers (all compose projects except `infrastructure`) →
+`docker compose stop` for infrastructure last, so Postgres closes with nothing
+still writing to it (never `down --remove-orphans`, which reaps docker-run
+containers including Postgres) → Hetzner API soft reboot → wait for SSH →
+`compose start` → `docker start pg-ci-proxy` (the one container with restart
+policy `no`) → assert runners + guard timer are back → verify container count,
+swap, and every endpoint in `endpoints.yml`.
+
+> **Guard before runners, apps before Postgres.** Both orderings were learned the
+> hard way during the 2026-08-05 CPX41→CPX51 upgrade. `runner-guard.timer` fires
+> every **2 minutes** and restarted all 19 runners *one second* after they were
+> stopped (`action=restarted(19/19)`) — so stopping runners without masking the
+> guard first achieves nothing, and one could pick up a queued job moments before
+> the power-off. And only 8 of the 49 containers are in the `infrastructure`
+> compose project; the other 41 span 14 more projects, so an infrastructure-only
+> stop pulls Postgres out from under ~39 live tenant apps and guarantees WAL
+> replay on the next boot. If the drain succeeds but the reboot never verifies,
+> an `if: failure()` step restores containers, runners, and the guard — otherwise
+> the box is left down with its own self-healing masked.
 
 `workflow_dispatch` accepts `force: true` to override the idle guards (still
 requires a pending reboot) for a deliberate manual window.

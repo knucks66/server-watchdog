@@ -136,19 +136,49 @@ jobs:
           fi
 
       - name: Drain the box
+        id: drain
         if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
         run: |
           SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
 
-          # Stop runners first so none accepts a job during the shutdown window.
+          # runner-guard.timer fires every 2 MINUTES and restarts any inactive
+          # runner — that is its whole job. Stopping the runners without stopping
+          # the guard first is useless: observed live on 2026-08-05, the guard
+          # restarted all 19 runners ONE SECOND after they were stopped
+          # (`action=restarted(19/19)`), and one of them could then pick up a
+          # queued job moments before the power-off. Guard first, runners second.
+          echo "Stopping runner-guard timer (it would resurrect the runners in <2min)..."
+          $SSH "systemctl stop runner-guard.timer" 2>/dev/null || true
+          echo "drained=true" >> "$GITHUB_OUTPUT"
+
           echo "Stopping self-hosted runners..."
           $SSH "systemctl stop 'actions.runner.*'" 2>/dev/null || true
+
+          # Confirm they stayed down rather than assuming — if the guard is still
+          # somehow active this is where we find out, before the power-off.
+          sleep 15
+          STILL_UP=$($SSH "systemctl list-units 'actions.runner.*' --state=active --no-legend --plain 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+          echo "runners still active after 15s: $STILL_UP"
+          if [ "${STILL_UP:-0}" != "0" ]; then
+            echo "❌ Runners came back — something is re-starting them. Aborting before power-off."
+            exit 1
+          fi
+
+          # Apps BEFORE infrastructure. 47 of the 49 containers belong to 15
+          # different compose projects; only 8 are in `infrastructure`. Running
+          # just the infrastructure stop pulls Postgres out from under ~39 live
+          # tenant apps, which is how you get WAL replay on the next boot.
+          echo "Stopping app containers (all projects except infrastructure)..."
+          $SSH "docker ps --format '{{.Names}}|{{.Label \"com.docker.compose.project\"}}' | awk -F'|' '\$2!=\"infrastructure\"{print \$1}' | xargs -r docker stop -t 30" >/dev/null 2>&1 || true
 
           # `stop`, never `down --remove-orphans` — that reaps docker-run
           # containers on this box, Postgres among them.
           echo "Stopping infrastructure containers (graceful Postgres shutdown)..."
-          $SSH "cd /opt/infrastructure && docker compose stop" 2>/dev/null || true
-          sleep 10
+          $SSH "cd /opt/infrastructure && docker compose stop -t 60" 2>/dev/null || true
+          sleep 5
+
+          LEFT=$($SSH "docker ps -q | wc -l" 2>/dev/null || echo "?")
+          echo "containers still running: $LEFT"
 
       - name: Reboot via Hetzner API
         if: steps.pending.outputs.required == 'yes' && steps.guards.outputs.safe == 'true'
@@ -194,16 +224,22 @@ jobs:
           echo "kernel now: $NEW_KERNEL (was ${{ steps.pending.outputs.running }})"
           echo "kernel=$NEW_KERNEL" >> "$GITHUB_OUTPUT"
 
-          # Docker's own restart policies bring back all but one container; start
-          # the stragglers explicitly rather than assuming.
+          # Docker restart policies bring back 48 of the 49 containers on their
+          # own, and both the runner units and runner-guard.timer are `enabled`
+          # so systemd starts them at boot. These calls are belt-and-braces for
+          # the stragglers — cheap, idempotent, and they turn "probably fine"
+          # into something verified below.
           echo "Starting infrastructure stack..."
           $SSH "cd /opt/infrastructure && docker compose start" 2>/dev/null || true
 
           # pg-ci-proxy is the one container with restart policy 'no'.
           $SSH "docker start pg-ci-proxy" 2>/dev/null || true
 
-          echo "Restarting self-hosted runners..."
           $SSH "systemctl start 'actions.runner.*'" 2>/dev/null || true
+          # The guard was stopped during the drain. It is enabled so it returns
+          # on boot, but assert it rather than trust it — a masked guard means
+          # nothing heals a dead runner until someone notices by hand.
+          $SSH "systemctl start runner-guard.timer" 2>/dev/null || true
 
           sleep 20
           RUNNING=$($SSH "docker ps -q | wc -l" 2>/dev/null || echo 0)
@@ -214,7 +250,11 @@ jobs:
             echo "⚠️ Not running:"; echo "$NOTUP" | sed 's/^/    /'
           fi
 
-          # Swap lives in /etc/fstab; confirm it actually came back.
+          echo -n "runners active: ";      $SSH "systemctl list-units 'actions.runner.*' --state=active --no-legend --plain 2>/dev/null | wc -l" 2>/dev/null || echo "?"
+          echo -n "runner-guard timer: ";  $SSH "systemctl is-active runner-guard.timer" 2>/dev/null || echo "?"
+
+          # Swap lives in /etc/fstab; confirm it actually came back — a box that
+          # boots without swap looks fine until the first memory spike.
           $SSH "swapon --show" 2>/dev/null || echo "⚠️ no swap active"
 
       - name: Verify endpoints are serving
@@ -234,6 +274,24 @@ jobs:
             exit 1
           fi
           echo "✅ All endpoints serving"
+
+      - name: Undrain if we drained but never rebooted
+        if: failure() && steps.drain.outputs.drained == 'true'
+        run: |
+          # Reached only when something between the drain and a verified boot
+          # failed — a rejected Hetzner API call, a box that never came back.
+          # Without this the server is left with every container down, the
+          # runners stopped, and runner-guard MASKED, so the guard can't even
+          # self-heal it. Best-effort: the box may be unreachable, in which case
+          # the alert below is the signal.
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
+          echo "⚠️  Drain happened but the reboot did not verify — attempting to restore service."
+          $SSH "cd /opt/infrastructure && docker compose start" 2>/dev/null || echo "  (could not start infrastructure — box may be down)"
+          $SSH "docker start pg-ci-proxy" 2>/dev/null || true
+          $SSH "systemctl start 'actions.runner.*'" 2>/dev/null || true
+          # Unmask the guard LAST so it doesn't race the explicit start above.
+          $SSH "systemctl start runner-guard.timer" 2>/dev/null || echo "  (could not restart runner-guard.timer — RESTART IT MANUALLY)"
+          echo "Restore attempted — verify manually before trusting it."
 
       - name: Report to Ownersbox/JARVIS
         if: always()
