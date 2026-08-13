@@ -65,3 +65,5 @@ endpoints:
     url: https://api.bnb-supply-closet.rumio.world/health
   - name: Air Cleared
     url: https://api.aircleared.com/health
+  - name: Volarly
+    url: https://api.volarly.com/health
