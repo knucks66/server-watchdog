@@ -67,3 +67,5 @@ endpoints:
     url: https://api.aircleared.com/health
   - name: Volarly
     url: https://api.volarly.com/health
+  - name: Sundrly
+    url: https://api.sundrly.com/health
