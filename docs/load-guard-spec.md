@@ -104,6 +104,106 @@ A new, **fast-cadence** GitHub Actions workflow focused solely on the fast-movin
 
 ---
 
+## runner-guard — active-but-offline detection (added 2026-08-16)
+
+`runner-guard` restarts runner units that are **inactive**. On 2026-08-16 every
+unit was `active` — so it skipped all of them — while GitHub had marked all three
+rumio runners **offline** and CI sat queued for four hours.
+
+"Active" only means the process is running. It says nothing about whether the
+runner can still reach GitHub: a runner starved of I/O keeps its process alive
+but stops heartbeating, and the local view and GitHub's view silently disagree.
+That disagreement is the sharpest available signal for the wedge — Layer 4's
+reaper catches the same class, but only after `MAX_JOB_HOURS`, whereas this
+catches it as soon as GitHub gives up on the heartbeat.
+
+**The check.** Every `GITHUB_CHECK_EVERY` invocations (default 5 ≈ 10 min), ask
+`GET /repos/{owner}/{repo}/actions/runners` once per repo. Any runner GitHub
+reports `offline` whose unit is locally `active` is a mismatch. After
+`OFFLINE_CONFIRMATIONS` consecutive mismatches (default 2), restart the unit,
+subject to the existing per-runner restart cooldown.
+
+**Fails closed.** With no `GITHUB_TOKEN` the check is skipped entirely and
+logged; the guard behaves exactly as before. Same token model as ownersbox's
+`ci-remediation.ts`.
+
+### Setup
+
+Add to `/etc/load-guard.env` (read by both guards):
+
+```
+GITHUB_TOKEN=ghp_...          # needs repo "Administration: read"
+```
+
+A fine-grained PAT scoped to the repos that own runners, or a classic PAT with
+`repo`. Read-only — this never writes to GitHub, only reads runner status.
+
+### Two traps this had to handle
+
+**The unit name is not a reliable repo key.** `/opt/github-runner`'s unit is
+`actions.runner.knucks66-lsg.hetzner-runner.service` — the repo was renamed
+LSG→rumio and the unit kept the old name forever. The check reads
+`<WorkingDirectory>/.runner` for `agentName` (what GitHub reports as `name`) and
+`gitHubUrl`, and fetches with `curl -L` because that URL is *also* stale
+(`https://github.com/knucks66/lsg`) and only resolves via GitHub's rename
+redirect.
+
+**A runner absent from the API is not a wedged runner.** It has been
+deregistered, restarting its unit will not bring it back, and acting would hide
+an operator problem. The check keys on an explicit `status == "offline"` only.
+
+**Tests:** `tests/test-runner-offline-check.sh` — 20 cases over slug parsing
+(including the stale pre-rename URL), offline selection (including the exact
+2026-08-16 payload, a busy-online runner, and a deregistered one), and the
+confirmation threshold.
+
+## Layer 4 — Stale-worker reaper (added 2026-08-16)
+
+**The failure this addresses.** Three orphaned `Runner.Worker` processes ran
+`vite build` for 2h43m *after GitHub had already given up on their jobs*,
+thrashing the disk at ~1.4M blocks/s. Every existing layer missed it, each for a
+different reason:
+
+| Layer | Why it missed |
+|---|---|
+| 1 — `runners.slice` MemoryMax 7G | Never fired. The builds totalled ~5.3 GB. The failure was **I/O**, not memory. |
+| 3 — load-guard | Detected it correctly every 2 minutes for hours, and logged `action=alert_only`. Load was critical while memory was fine, and its only levers were memory-shaped: restart postgres (healthy), or `SHED_BUILDS` (opt-in, off). |
+| `runner-guard` | Restarts **inactive** units. These units were **active** — wedged, not dead. |
+
+The result was a self-sustaining deadlock: orphaned builds saturate the box →
+runners cannot heartbeat → GitHub marks them offline → queued jobs never
+dispatch → nothing exists to clear the orphans. It does **not** resolve on its
+own; a human killed it after ~2h45m.
+
+**The rule.** Under sustained critical load, kill `Runner.Worker` processes older
+than `MAX_JOB_HOURS`, then restart the runner units so they re-register.
+
+**Why this is safe on by default where `SHED_BUILDS` is not.** It is scoped by
+**age**, not by process type. The longest legitimate job on this box is ~50 min,
+so a worker past 3h cannot be a healthy job — there is no innocent process in the
+target set. `SHED_BUILDS` matches on *what a process is* (`vite build`), which is
+why it can hit a real build and stays opt-in.
+
+**Deliberately excluded:** `Runner.Listener` (the long-lived supervisor — older
+than any threshold, and killing it takes the runner offline, which is the failure
+being prevented) and the build processes themselves (a `vite build` may be
+legitimately old under a healthy worker; the *worker's* age is the honest signal).
+
+**Tunables** (`/etc/load-guard.env`): `REAP_STALE_WORKERS` (default 1),
+`MAX_JOB_HOURS` (default 3), `SUSTAINED_CRIT_SAMPLES` (default 10 ≈ 20 min at the
+2-minute cadence). The reaper fires at `max(age > MAX_JOB_HOURS, sustained
+critical)`. Against the 2026-08-16 timeline that is ~14:42 UTC — about 15 minutes
+after the manual fix, and roughly 3 hours earlier than "never".
+
+**Honest limit:** 3h is chosen for certainty, not speed. A CI shard here can
+legitimately run past an hour, so a tighter threshold trades a shorter outage for
+the risk of killing real work. Lower it only with evidence about real job
+durations.
+
+**Tests:** `tests/test-select-stale-workers.sh` drives the selection function with
+`ps` fixtures from the actual incident, including the listener, a healthy
+50-minute worker, postgres at 10 days, and the exact-threshold boundary.
+
 ## Layer 3 — On-box fast fail-safe (recommended)
 
 GitHub `schedule:` runs are deprioritized exactly during high-load incidents (observed: 56-min gap during this outage). A tiny on-box timer guarantees a local response even when GitHub is slow and even if the box can't reach GitHub.

@@ -87,7 +87,7 @@ jobs:
           # Map to a coarse alert key so we fire only on transitions, not every
           # tick (state-change dedup).
           case "$ACTION" in
-            shed_builds*|restarted_postgres*|*restarted_postgres*) KEY="REMEDIATED" ;;
+            shed_builds*|reaped_stale_workers*|restarted_postgres*|*restarted_postgres*|*reaped_stale_workers*) KEY="REMEDIATED" ;;
             *) case "$LEVEL" in critical*) KEY="CRITICAL" ;; *) KEY="OK" ;; esac ;;
           esac
 
