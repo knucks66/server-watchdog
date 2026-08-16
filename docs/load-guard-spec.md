@@ -104,6 +104,59 @@ A new, **fast-cadence** GitHub Actions workflow focused solely on the fast-movin
 
 ---
 
+## runner-guard — active-but-offline detection (added 2026-08-16)
+
+`runner-guard` restarts runner units that are **inactive**. On 2026-08-16 every
+unit was `active` — so it skipped all of them — while GitHub had marked all three
+rumio runners **offline** and CI sat queued for four hours.
+
+"Active" only means the process is running. It says nothing about whether the
+runner can still reach GitHub: a runner starved of I/O keeps its process alive
+but stops heartbeating, and the local view and GitHub's view silently disagree.
+That disagreement is the sharpest available signal for the wedge — Layer 4's
+reaper catches the same class, but only after `MAX_JOB_HOURS`, whereas this
+catches it as soon as GitHub gives up on the heartbeat.
+
+**The check.** Every `GITHUB_CHECK_EVERY` invocations (default 5 ≈ 10 min), ask
+`GET /repos/{owner}/{repo}/actions/runners` once per repo. Any runner GitHub
+reports `offline` whose unit is locally `active` is a mismatch. After
+`OFFLINE_CONFIRMATIONS` consecutive mismatches (default 2), restart the unit,
+subject to the existing per-runner restart cooldown.
+
+**Fails closed.** With no `GITHUB_TOKEN` the check is skipped entirely and
+logged; the guard behaves exactly as before. Same token model as ownersbox's
+`ci-remediation.ts`.
+
+### Setup
+
+Add to `/etc/load-guard.env` (read by both guards):
+
+```
+GITHUB_TOKEN=ghp_...          # needs repo "Administration: read"
+```
+
+A fine-grained PAT scoped to the repos that own runners, or a classic PAT with
+`repo`. Read-only — this never writes to GitHub, only reads runner status.
+
+### Two traps this had to handle
+
+**The unit name is not a reliable repo key.** `/opt/github-runner`'s unit is
+`actions.runner.knucks66-lsg.hetzner-runner.service` — the repo was renamed
+LSG→rumio and the unit kept the old name forever. The check reads
+`<WorkingDirectory>/.runner` for `agentName` (what GitHub reports as `name`) and
+`gitHubUrl`, and fetches with `curl -L` because that URL is *also* stale
+(`https://github.com/knucks66/lsg`) and only resolves via GitHub's rename
+redirect.
+
+**A runner absent from the API is not a wedged runner.** It has been
+deregistered, restarting its unit will not bring it back, and acting would hide
+an operator problem. The check keys on an explicit `status == "offline"` only.
+
+**Tests:** `tests/test-runner-offline-check.sh` — 20 cases over slug parsing
+(including the stale pre-rename URL), offline selection (including the exact
+2026-08-16 payload, a busy-online runner, and a deregistered one), and the
+confirmation threshold.
+
 ## Layer 4 — Stale-worker reaper (added 2026-08-16)
 
 **The failure this addresses.** Three orphaned `Runner.Worker` processes ran
