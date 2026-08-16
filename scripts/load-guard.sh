@@ -15,6 +15,21 @@
 # by vitest and many other tools, so it kills innocent CI/test runs. An opt-in,
 # tightly-scoped backstop is available via SHED_BUILDS=1 (see below).
 #
+# It DOES reap stale Actions workers (2026-08-16). That outage was invisible to
+# every existing layer: three orphaned `Runner.Worker` processes ran `vite build`
+# for 2h43m after GitHub had already given up on their jobs, thrashing the disk
+# at ~1.4M blocks/s. Layer 1 never fired — the builds totalled ~5.3 GB, under the
+# 7 GB cap, because the failure was I/O, not memory. runner-guard never fired —
+# it restarts INACTIVE units, and these units were active. And this script logged
+# `action=alert_only` every two minutes for hours, because load was critical while
+# memory was fine and its only levers were memory-shaped.
+#
+# The reaper is scoped by AGE, not by process type, which is what makes it safe
+# where SHED_BUILDS is not: a worker older than MAX_JOB_HOURS cannot be a healthy
+# job (the longest real job on this box is ~50 min), so there is no innocent
+# process in the target set. It also fires only after load has been critical for
+# SUSTAINED_CRIT_SAMPLES consecutive samples, so a brief spike never triggers it.
+#
 # Runs identically from the on-box systemd timer (Layer 3) or piped over SSH by
 # the GitHub workflow (Layer 2). A flock serializes the two cadences; a
 # statefile carries the debounce across invocations. Must run as root.
@@ -28,6 +43,15 @@
 #   SHED_BUILDS        (default 0)    if 1, also kill *deploy* builds in
 #                                     runners.slice (vite build / npm run build),
 #                                     never bare esbuild/vitest. Backstop only.
+#   REAP_STALE_WORKERS (default 1)    reap Runner.Worker processes older than
+#                                     MAX_JOB_HOURS once load has been critical
+#                                     for SUSTAINED_CRIT_SAMPLES samples.
+#   MAX_JOB_HOURS      (default 3)    a worker older than this is not a job any
+#                                     more. Longest real job here is ~50 min, so
+#                                     3h is >3x headroom.
+#   SUSTAINED_CRIT_SAMPLES (default 10) consecutive critical samples before the
+#                                     reaper is allowed to act (~20 min at the
+#                                     2-minute timer cadence).
 #
 # Why swap is gated: after an OOM the kernel leaves pages in swap even once RAM
 # is plentiful again. High swap% with healthy MemAvailable is stale, not
@@ -45,6 +69,37 @@ MEM_LOW_MB="${MEM_LOW_MB:-1500}"
 SWAP_CRIT_PCT="${SWAP_CRIT_PCT:-90}"
 PG_CONTAINER="${PG_CONTAINER:-infrastructure-postgres-1}"
 SHED_BUILDS="${SHED_BUILDS:-0}"
+REAP_STALE_WORKERS="${REAP_STALE_WORKERS:-1}"
+MAX_JOB_HOURS="${MAX_JOB_HOURS:-3}"
+SUSTAINED_CRIT_SAMPLES="${SUSTAINED_CRIT_SAMPLES:-10}"
+
+# select_stale_workers <max_secs>
+#
+# Reads `ps -eo pid=,etimes=,args=` on stdin, emits "<pid>:<etimes>s" for every
+# Actions worker older than <max_secs>. Pure: no side effects, no ps call — so
+# tests/test-select-stale-workers.sh can drive it with fixtures. The dangerous
+# half of the reaper is the SELECTION, so that is the half that is testable.
+#
+# Matches Runner.Worker ONLY. Not Runner.Listener (the long-lived supervisor —
+# it is *always* older than any threshold and killing it takes the runner
+# offline), and not the build processes themselves (a `vite build` may legitimately
+# be minutes old under a healthy worker; the worker's own age is the honest
+# signal for "this job is not a job any more").
+select_stale_workers() {
+  local max_secs="$1" pid etimes args
+  while read -r pid etimes args; do
+    [ -z "${pid:-}" ] && continue
+    case "$args" in
+      *Runner.Listener*) continue ;;
+      *Runner.Worker*) ;;
+      *) continue ;;
+    esac
+    case "$etimes" in (*[!0-9]*|"") continue ;; esac
+    [ "$etimes" -gt "$max_secs" ] || continue
+    printf '%s:%ss
+' "$pid" "$etimes"
+  done
+}
 
 # Optional: report to the Ownersbox dashboard so JARVIS gains awareness of
 # load-guard activity (Layers 2 AND 3 share this engine). Interventions
@@ -127,11 +182,24 @@ if [ "$swap_pct" -ge "$SWAP_CRIT_PCT" ] 2>/dev/null && [ "$mem_avail" -lt "$MEM_
   level=critical; reasons="${reasons:+$reasons,}swap=${swap_pct}%>=${SWAP_CRIT_PCT}+mem_low"
 fi
 
-prev=$(cat "$STATE" 2>/dev/null || echo ok)
-echo "$level" > "$STATE" 2>/dev/null || true
+# Statefile carries "<level>:<consecutive-critical-count>". Older installs wrote
+# a bare level, so parse defensively — a missing count reads as 0 and the reaper
+# simply waits one more sample rather than misfiring on an unknown history.
+state_raw=$(cat "$STATE" 2>/dev/null || echo ok)
+prev="${state_raw%%:*}"
+prev_crit_n="${state_raw#*:}"
+case "$prev_crit_n" in (*[!0-9]*|"") prev_crit_n=0 ;; esac
+[ "$prev" = critical ] || prev_crit_n=0
+
+if [ "$level" = critical ]; then
+  crit_n=$(( prev_crit_n + 1 ))
+else
+  crit_n=0
+fi
+echo "${level}:${crit_n}" > "$STATE" 2>/dev/null || true
 
 ts=$(date -u +%FT%TZ)
-metrics="load1=${load1}(crit>=${LOAD_CRIT}) mem_avail=${mem_avail}MB swap=${swap_pct}%"
+metrics="load1=${load1}(crit>=${LOAD_CRIT}) mem_avail=${mem_avail}MB swap=${swap_pct}% crit_n=${crit_n}"
 printf '%s level=%s prev=%s %s\n' "$ts" "$level" "$prev" "$metrics" >> "$LOG" 2>/dev/null || true
 
 if [ "$level" != critical ]; then
@@ -168,6 +236,44 @@ if [ "$SHED_BUILDS" = "1" ]; then
     done
   fi
   [ -n "$killed" ] && { sleep 3; for p in $killed; do kill -KILL "$p" 2>/dev/null || true; done; actions="shed_builds(${killed# })"; }
+fi
+
+# Reap STALE Actions workers. Scoped by AGE, which is what makes this safe to
+# have on by default where SHED_BUILDS is not: the longest legitimate job on this
+# box is ~50 min, so anything past MAX_JOB_HOURS is not a job any more — it is an
+# orphan whose GitHub-side job is already gone. Killing it frees the box; leaving
+# it wedges CI indefinitely, because a saturated box stops the runners
+# heartbeating, GitHub marks them offline, queued jobs never dispatch, and
+# nothing then exists to clear the orphan. That deadlock is the 2026-08-16
+# outage, and it is self-sustaining: it does not resolve on its own.
+#
+# Gated on SUSTAINED critical rather than the 2-sample debounce the other actions
+# use. A long build legitimately drives load up; only load that STAYS critical
+# for ~20 minutes alongside an over-age worker indicates the wedge.
+if [ "$REAP_STALE_WORKERS" = "1" ] && [ "$crit_n" -ge "$SUSTAINED_CRIT_SAMPLES" ] 2>/dev/null; then
+  max_job_secs=$(( MAX_JOB_HOURS * 3600 ))
+  reaped=""
+  for entry in $(ps -eo pid=,etimes=,args= 2>/dev/null | select_stale_workers "$max_job_secs"); do
+    rpid="${entry%%:*}"
+    # Children first: vite/esbuild reparent to init and survive if the worker
+    # dies before them.
+    pkill -TERM -P "$rpid" 2>/dev/null
+    kill -TERM "$rpid" 2>/dev/null
+    reaped="${reaped} ${entry}"
+  done
+
+  if [ -n "$reaped" ]; then
+    sleep 5
+    for entry in $reaped; do
+      rp="${entry%%:*}"
+      pkill -KILL -P "$rp" 2>/dev/null
+      kill -KILL "$rp" 2>/dev/null
+    done
+    # A worker killed mid-job leaves its runner listener confused; restart the
+    # units so they re-register cleanly and start taking work again.
+    systemctl restart 'actions.runner.*' >> "$LOG" 2>&1 || true
+    actions="${actions:+$actions,}reaped_stale_workers(${reaped# })"
+  fi
 fi
 
 # Protect the victim: if postgres is unhealthy, restart it via compose labels

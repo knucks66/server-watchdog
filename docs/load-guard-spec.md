@@ -104,6 +104,53 @@ A new, **fast-cadence** GitHub Actions workflow focused solely on the fast-movin
 
 ---
 
+## Layer 4 — Stale-worker reaper (added 2026-08-16)
+
+**The failure this addresses.** Three orphaned `Runner.Worker` processes ran
+`vite build` for 2h43m *after GitHub had already given up on their jobs*,
+thrashing the disk at ~1.4M blocks/s. Every existing layer missed it, each for a
+different reason:
+
+| Layer | Why it missed |
+|---|---|
+| 1 — `runners.slice` MemoryMax 7G | Never fired. The builds totalled ~5.3 GB. The failure was **I/O**, not memory. |
+| 3 — load-guard | Detected it correctly every 2 minutes for hours, and logged `action=alert_only`. Load was critical while memory was fine, and its only levers were memory-shaped: restart postgres (healthy), or `SHED_BUILDS` (opt-in, off). |
+| `runner-guard` | Restarts **inactive** units. These units were **active** — wedged, not dead. |
+
+The result was a self-sustaining deadlock: orphaned builds saturate the box →
+runners cannot heartbeat → GitHub marks them offline → queued jobs never
+dispatch → nothing exists to clear the orphans. It does **not** resolve on its
+own; a human killed it after ~2h45m.
+
+**The rule.** Under sustained critical load, kill `Runner.Worker` processes older
+than `MAX_JOB_HOURS`, then restart the runner units so they re-register.
+
+**Why this is safe on by default where `SHED_BUILDS` is not.** It is scoped by
+**age**, not by process type. The longest legitimate job on this box is ~50 min,
+so a worker past 3h cannot be a healthy job — there is no innocent process in the
+target set. `SHED_BUILDS` matches on *what a process is* (`vite build`), which is
+why it can hit a real build and stays opt-in.
+
+**Deliberately excluded:** `Runner.Listener` (the long-lived supervisor — older
+than any threshold, and killing it takes the runner offline, which is the failure
+being prevented) and the build processes themselves (a `vite build` may be
+legitimately old under a healthy worker; the *worker's* age is the honest signal).
+
+**Tunables** (`/etc/load-guard.env`): `REAP_STALE_WORKERS` (default 1),
+`MAX_JOB_HOURS` (default 3), `SUSTAINED_CRIT_SAMPLES` (default 10 ≈ 20 min at the
+2-minute cadence). The reaper fires at `max(age > MAX_JOB_HOURS, sustained
+critical)`. Against the 2026-08-16 timeline that is ~14:42 UTC — about 15 minutes
+after the manual fix, and roughly 3 hours earlier than "never".
+
+**Honest limit:** 3h is chosen for certainty, not speed. A CI shard here can
+legitimately run past an hour, so a tighter threshold trades a shorter outage for
+the risk of killing real work. Lower it only with evidence about real job
+durations.
+
+**Tests:** `tests/test-select-stale-workers.sh` drives the selection function with
+`ps` fixtures from the actual incident, including the listener, a healthy
+50-minute worker, postgres at 10 days, and the exact-threshold boundary.
+
 ## Layer 3 — On-box fast fail-safe (recommended)
 
 GitHub `schedule:` runs are deprioritized exactly during high-load incidents (observed: 56-min gap during this outage). A tiny on-box timer guarantees a local response even when GitHub is slow and even if the box can't reach GitHub.
