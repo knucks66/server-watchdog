@@ -70,12 +70,12 @@ jobs:
             echo "- raw: \`$RESULT\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Alert on state change (ntfy push)
+      - name: Alert on state change (Discord)
         env:
-          NTFY_URL: ${{ secrets.NTFY_URL }}
+          WATCHDOG_DISCORD_WEBHOOK: ${{ secrets.WATCHDOG_DISCORD_WEBHOOK }}
         run: |
-          if [ -z "${NTFY_URL:-}" ]; then
-            echo "No NTFY_URL secret — skipping alert (detection/remediation still ran)."
+          if [ -z "${WATCHDOG_DISCORD_WEBHOOK:-}" ]; then
+            echo "No WATCHDOG_DISCORD_WEBHOOK secret — skipping alert (detection/remediation still ran)."
             exit 0
           fi
           SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
@@ -103,17 +103,25 @@ jobs:
           # Persist the new key for next-run dedup.
           $SSH "printf '%s' '$KEY' > /run/load-guard.alerted" || true
 
-          # ntfy: Title/Priority/Tags are headers; the body is the raw RESULT.
-          # https://docs.ntfy.sh/publish/
+          # Discord embed. Colour carries the severity that ntfy carried in its
+          # Priority header; the raw RESULT line is the body, unchanged.
           case "$KEY" in
-            OK)         TITLE="Load Guard recovered";        PRIO="default"; TAGS="white_check_mark" ;;
-            REMEDIATED) TITLE="Load Guard acted on the box"; PRIO="high";    TAGS="hammer_and_wrench" ;;
-            *)          TITLE="Load Guard: CRITICAL pressure"; PRIO="high";  TAGS="warning" ;;
+            OK)         TITLE="✅ Load Guard recovered";          COLOR=3066993 ;;
+            REMEDIATED) TITLE="🔧 Load Guard acted on the box";   COLOR=15844367 ;;
+            *)          TITLE="⚠️ Load Guard: CRITICAL pressure"; COLOR=15158332 ;;
           esac
 
-          curl -fsS \
-            -H "Title: ${TITLE}" \
-            -H "Priority: ${PRIO}" \
-            -H "Tags: ${TAGS}" \
-            -d "${RESULT:-load-guard state change: $KEY}" \
-            "$NTFY_URL" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"
+          # jq builds the JSON so a RESULT containing quotes/newlines cannot
+          # break out of the payload — the reason line is machine-generated but
+          # carries free-form reasons.
+          jq -nc \
+            --arg title "$TITLE" \
+            --arg desc "${RESULT:-load-guard state change: $KEY}" \
+            --argjson color "$COLOR" \
+            '{embeds:[{title:$title,description:("```"+$desc+"```"),color:$color}]}' \
+            > /tmp/discord-payload.json
+
+          curl -fsS -X POST \
+            -H "Content-Type: application/json" \
+            -d @/tmp/discord-payload.json \
+            "$WATCHDOG_DISCORD_WEBHOOK" >/dev/null && echo "alert sent: $KEY" || echo "alert POST failed"

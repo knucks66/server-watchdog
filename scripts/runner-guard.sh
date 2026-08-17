@@ -6,6 +6,8 @@
 #   1. systemctl is-active for each runner service
 #   2. Restart any that are inactive/failed
 #   3. OPTIONAL: restart units that are ACTIVE but which GitHub reports offline
+#      — unless a Runner.Worker is executing a job under that unit (see
+#        unit_has_running_job; step 3 defers rather than cancelling live work)
 #   4. Per-runner cooldown prevents restart loops
 #   5. Report interventions to Ownersbox via the watchdog event webhook
 #
@@ -19,6 +21,13 @@
 # That mismatch is the sharpest available signal for the wedge — load-guard's
 # reaper (Layer 4) catches the same class, but only after MAX_JOB_HOURS, whereas
 # this catches it as soon as GitHub gives up on the heartbeat.
+#
+# It is NOT, on its own, sufficient to act on. The same I/O starvation that
+# wedges a runner also stops a perfectly healthy one from heartbeating, and on
+# 2026-08-17 this guard restarted 10 of 19 runners twice while they were mid-job,
+# cancelling the very deploys whose build wave had caused the starvation. So
+# step 3 now defers whenever a Runner.Worker is live under the unit. See
+# unit_has_running_job for why deferring loses nothing.
 #
 # It needs a token, so it FAILS CLOSED: with no GITHUB_TOKEN the check is skipped
 # entirely and logged, and the guard behaves exactly as it did before. Same token
@@ -153,6 +162,48 @@ should_act_on_offline() {
   [ "$n" -ge "$threshold" ]
 }
 
+# unit_has_running_job <working-dir>
+#
+# Reads `ps -eo args=` on stdin; returns 0 if a Runner.Worker is executing under
+# <working-dir>. Pure: no ps call, no systemctl — so the test can drive it with
+# fixtures. Like select_stale_workers, the dangerous half is the SELECTION.
+#
+# This is the guard the 2026-08-17 incident needed. Step 3's premise is that
+# "active locally + offline at GitHub" means wedged, but the header above states
+# the other half itself: "a runner starved of I/O keeps its process alive but
+# stops heartbeating". Under a 4-way parallel `vite build` wave that describes a
+# perfectly HEALTHY runner mid-job. Restarting it kills the job
+# ("Runner will be shutdown for UserCancelled"), the matrix redispatches, and the
+# I/O storm restarts — a loop that cancelled 6 tenant deploys and completed 1 of
+# 21 in 90 minutes while this guard restarted 10 of 19 runners twice.
+#
+# Matches Runner.Worker only, never Runner.Listener: the Listener is the
+# long-lived supervisor and is present whether or not a job is running, so
+# keying on it would disable step 3 entirely.
+#
+# A genuinely wedged runner is not lost by deferring — its worker keeps aging
+# until load-guard's reaper takes it at MAX_JOB_HOURS, after which the unit is
+# idle and the very next tick restarts it. Layers in the right order: kill the
+# stuck JOB by age, not the runner that might still be doing real work.
+#
+# Deliberately NOT keyed on the GitHub API's `busy` field, which is also in hand:
+# a runner wedged mid-job can report busy forever, so busy alone would make
+# step 3 unreachable for exactly the wedge it exists to catch. The local worker
+# process is the observable, and the reaper bounds how long it can lie.
+unit_has_running_job() {
+  local wd="${1:-}" args
+  [ -n "$wd" ] || return 1
+  while read -r args; do
+    case "$args" in
+      *Runner.Listener*) continue ;;
+      *Runner.Worker*) ;;
+      *) continue ;;
+    esac
+    case "$args" in "$wd"/*) return 0 ;; esac
+  done
+  return 1
+}
+
 exec 9>"$LOCK" 2>/dev/null || { echo "RESULT action=skip level=ok reason=no-lockfile"; exit 0; }
 if ! flock -n 9; then
   echo "RESULT action=skip level=ok reason=already-running"
@@ -261,6 +312,18 @@ for entry in "${UNITS[@]}"; do
     mv "${OFFLINE_STATE}.tmp" "$OFFLINE_STATE" 2>/dev/null || true
 
     should_act_on_offline "$mismatch_n" "$OFFLINE_CONFIRMATIONS" || continue
+
+    # Never cancel a live job. Reported as a problem rather than silently
+    # skipped, so the RESULT line shows the guard saw the mismatch and chose to
+    # wait. The mismatch counter is deliberately left to keep climbing and the
+    # cooldown untouched: if the runner is still offline once the job ends, the
+    # next tick acts immediately instead of restarting the confirmation clock.
+    if ps -eo args= 2>/dev/null | unit_has_running_job "$wd"; then
+      problems+=("${agent}(offline-but-busy x${mismatch_n})")
+      printf '%s DEFERRED_OFFLINE unit=%s agent=%s reason=job-running confirmations=%s\n' \
+        "$ts" "$unit" "$agent" "$mismatch_n" >> "$LOG" 2>/dev/null || true
+      continue
+    fi
 
     now_s=$(date +%s)
     last_restart=$(read_cooldown "$runner_name")

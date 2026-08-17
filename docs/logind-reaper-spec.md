@@ -135,7 +135,7 @@ visibility-only heads-up before any action.
 ### Layer 2 — `logind-reaper.yml` (cloud cadence + alerting)
 
 Every **30 minutes** (`cron: '*/30 * * * *'`), pipes the repo's engine over SSH
-to the box and runs it as root, parses the `RESULT` line, and sends an **ntfy**
+to the box and runs it as root, parses the `RESULT` line, and sends a **Discord**
 push on state change (deduped via `/run/logind-reaper.alerted`: `OK` / `WARN` /
 `CRITICAL` / `REAPED`). The cadence is intentionally slow — the leak is glacial,
 the threshold leaves weeks of headroom, and each run is itself an SSH login (the
@@ -158,7 +158,7 @@ never double-act.
 
 The engine's `emit()` pushes to Ownersbox on **interventions only** (a reap, or
 a critical it couldn't clear) — not on quiet ok/warn runs. Warn state-change
-alerting is handled by the Layer 2 ntfy path, and liveness by load-guard's
+alerting is handled by the Layer 2 Discord path, and liveness by load-guard's
 heartbeat + the pulled GitHub Actions run status, so the reaper deliberately
 does **not** add a third heartbeat stream. Set `OBX_WEBHOOK_URL` + `OBX_TOKEN`
 (repo secrets for Layer 2; `/etc/load-guard.env` or `/etc/logind-reaper.env` for
@@ -179,7 +179,7 @@ Layer 3) to enable; absent them, detection and remediation still run.
    stays healthy, and that `fds` drops to the ~20s. Confirm the cooldown blocks
    a second restart on the next tick.
 5. **Negative:** healthy box (fds < `FD_WARN`) → `action=none level=ok`, no
-   ntfy alert, no Ownersbox push.
+   Discord alert, no Ownersbox push.
 
 ## Open questions
 

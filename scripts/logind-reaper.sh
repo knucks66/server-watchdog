@@ -58,7 +58,7 @@ COOLDOWN_SECS="${COOLDOWN_SECS:-1800}"
 # Optional: report to the Ownersbox dashboard so JARVIS gains awareness of any
 # reap (Layers 2 AND 3 share this engine). Policy is "push interventions only":
 # a reap or an un-actable critical is pushed immediately; quiet ok/warn runs are
-# NOT pushed (warn state-change alerting is handled by the Layer 2 ntfy path,
+# NOT pushed (warn state-change alerting is handled by the Layer 2 Discord path,
 # and liveness by load-guard's heartbeat + the pulled GitHub run status — a
 # third heartbeat stream here would just be noise). Silently no-ops when the
 # env vars are unset.
