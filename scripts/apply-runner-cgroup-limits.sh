@@ -50,7 +50,7 @@ CPUWeight=${SLICE_CPU_WEIGHT}
 IOWeight=${SLICE_IO_WEIGHT}
 EOF
 
-echo "=== 2. Adding Slice= drop-in to each actions.runner.* unit ==="
+echo "=== 2. Adding Slice= + KillMode= drop-in to each actions.runner.* unit ==="
 mapfile -t UNITS < <(systemctl list-units 'actions.runner.*' --all --no-legend --plain 2>/dev/null | awk '{print $1}')
 if [ "${#UNITS[@]}" -eq 0 ]; then
   echo "No actions.runner.* units found — nothing to do." >&2
@@ -64,6 +64,22 @@ for unit in "${UNITS[@]}"; do
 # Managed by server-watchdog/scripts/apply-runner-cgroup-limits.sh
 [Service]
 Slice=runners.slice
+# GitHub's stock unit ships KillMode=process, which signals ONLY runsvc.sh on
+# stop. runsvc.sh forwards SIGINT to Runner.Listener; when the listener doesn't
+# take it, systemd hits TimeoutStopSec and — because of KillMode=process —
+# never SIGKILLs the children. The unit reports stopped while an orphaned
+# listener keeps running, so the NEXT start adds a second listener rather than
+# replacing the first. Two listeners share one agentId, fight over the session,
+# and GitHub flaps the runner offline while systemd insists it is active.
+#
+# Observed on hetzner-runner-wawmfd 2026-08-17: two listeners (21:04 and 00:30)
+# against agentId 2; the runner showed offline for hours and queued every job,
+# and killing the orphan brought it online within 40s.
+#
+# `mixed` keeps SIGTERM going to the main process only, so an in-flight job
+# still gets the full TimeoutStopSec (5min) to finish, but anything left in the
+# cgroup after that is SIGKILLed instead of orphaned.
+KillMode=mixed
 EOF
   echo "  drop-in: ${dir}/slice.conf"
 done
