@@ -44,7 +44,7 @@ Runs every **2 hours**. SSHes into the server and monitors resource usage.
 ### 4. Load Guard (`load-guard.yml`)
 
 Runs every **5 minutes**. Runs the shared guard engine (`scripts/load-guard.sh`)
-on the box and sends ntfy push alerts on state changes.
+on the box and sends Discord alerts on state changes.
 
 **What it checks:** 1-min load (critical at `cores × 4`), `MemAvailable`, swap %
 (swap only counts when MemAvailable is also low — avoids stale-swap false
@@ -61,12 +61,12 @@ trigger.
 The same engine runs on-box every **2 minutes** via a systemd timer (Layer 3,
 `scripts/install-load-guard.sh`) — the fast local fail-safe for when GitHub
 deprioritizes the scheduled run under load. The two cadences coordinate via a
-flock + statefile. Alerting is ntfy push, state-change-deduplicated.
+flock + statefile. Alerting is a Discord webhook, state-change-deduplicated.
 
 ### 5. Logind Reaper (`logind-reaper.yml`)
 
 Runs every **30 minutes**. Runs the shared reaper engine
-(`scripts/logind-reaper.sh`) on the box and sends ntfy push alerts on state
+(`scripts/logind-reaper.sh`) on the box and sends Discord alerts on state
 changes.
 
 **The problem it fixes:** `systemd-logind` (systemd 255) leaks sessions stuck in
@@ -176,7 +176,7 @@ fail-safe (Layer 3).
 | `HETZNER_SERVER_ID` | health-check | Hetzner server ID |
 | `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard, logind-reaper | Ed25519 private key for root@server |
 | `SERVER_IP` | container-health, resource-monitor, load-guard, logind-reaper | Server IP address |
-| `NTFY_URL` | load-guard, logind-reaper | Full ntfy topic URL (e.g. `https://ntfy.sh/<private-topic>`) for push alerts (optional — detection/remediation run without it) |
+| `WATCHDOG_DISCORD_WEBHOOK` | load-guard, logind-reaper | Discord webhook URL for the watchdog's **own** channel (optional — detection/remediation run without it). Posted directly from the workflow, never via ownersbox, so the watchdog stays independent of the platform it may be rescuing. Replaced `NTFY_URL` on 2026-08-17. |
 | `OBX_WEBHOOK_URL` | all | Ownersbox ingest endpoint `https://ownersbox.rumio.world/api/watchdog/event` (optional — feeds JARVIS) |
 | `OBX_TOKEN` | all | Ownersbox agent token (`obx_…`) for the `watchdog` agent, `event:write` scope (optional) |
 

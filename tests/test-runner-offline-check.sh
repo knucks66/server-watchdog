@@ -23,7 +23,7 @@ CR=$(printf '\015')
 
 # Source only the pure helpers - the script takes a flock, writes /run state and
 # restarts services. Extracting from the SHIPPED file means these cannot drift.
-for fn in repo_slug_from_url offline_runner_names should_act_on_offline; do
+for fn in repo_slug_from_url offline_runner_names should_act_on_offline unit_has_running_job; do
   eval "$(sed -n "/^${fn}() {/,/^}/p" "$SRC" | tr -d "$CR")"
   declare -F "$fn" >/dev/null || { echo "FAIL: could not extract $fn"; exit 1; }
 done
@@ -85,6 +85,42 @@ check_rc "2 confirmations acts"  0 should_act_on_offline 2 2
 check_rc "3 confirmations acts"  0 should_act_on_offline 3 2
 check_rc "garbage count waits"   1 should_act_on_offline abc 2
 check_rc "empty count waits"     1 should_act_on_offline "" 2
+
+echo
+echo "unit_has_running_job:"
+# Fixtures are the real `ps -eo args=` from the 2026-08-17 storm, where three
+# rumio runners were mid-`vite build` while GitHub reported them offline and this
+# guard restarted them, cancelling all three jobs.
+BUSY='/opt/github-runner/bin.2.336.0/Runner.Worker spawnclient 156 159
+/opt/github-runner-rumio-2/bin.2.336.0/Runner.Worker spawnclient 156 159
+/opt/github-runner-rumio-3/bin.2.336.0/Runner.Worker spawnclient 149 152
+/opt/github-runner-rumio-3/bin/Runner.Listener run --startuptype service
+node /opt/github-runner-rumio-2/_work/rumio/rumio/node_modules/.bin/vite build'
+# Feeds fixture text as stdin. A `bash -c` wrapper would not inherit the
+# extracted function, so the pipe is built here instead.
+busy_check() { printf '%s\n' "$1" | unit_has_running_job "$2"; }
+
+check_rc "mid-build runner is busy"        0 busy_check "$BUSY" /opt/github-runner-rumio-2
+check_rc "the incident: rumio-3 is busy"   0 busy_check "$BUSY" /opt/github-runner-rumio-3
+
+# The prefix trap: /opt/github-runner is a prefix of /opt/github-runner-rumio-2.
+# A substring match would call the idle lsg runner busy and disable step 3 for it
+# whenever any rumio runner was building. The trailing slash in the glob is what
+# prevents that, so it gets its own test.
+IDLE_PREFIX='/opt/github-runner-rumio-2/bin.2.336.0/Runner.Worker spawnclient 156 159'
+check_rc "sibling with shared prefix is idle" 1 busy_check "$IDLE_PREFIX" /opt/github-runner
+
+# The Listener is always present. Keying on it would make step 3 unreachable.
+LISTENER_ONLY='/opt/github-runner-ownersbox/bin/Runner.Listener run --startuptype service'
+check_rc "listener alone is not a job"     1 busy_check "$LISTENER_ONLY" /opt/github-runner-ownersbox
+
+# The genuine wedge this guard exists for: unit active, nothing executing.
+check_rc "no worker means restartable"     1 busy_check "$BUSY" /opt/github-runner-taxengine
+check_rc "empty ps output is idle"         1 busy_check "" /opt/github-runner
+# An unreadable WorkingDirectory must not read as "idle-and-safe-to-restart"...
+# but it also must not block forever; empty wd means we could not tell, and the
+# caller already skips units whose .runner is unreadable.
+check_rc "empty working dir is idle"       1 busy_check "$BUSY" ""
 
 echo
 echo "passed=$pass failed=$fail"
