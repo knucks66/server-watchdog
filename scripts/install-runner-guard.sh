@@ -8,6 +8,14 @@
 # Idempotent. Run as root, from a checkout of this repo:
 #   sudo ./scripts/install-runner-guard.sh
 #
+# PREREQUISITE: scripts/install-runner-cgroup-limits.sh must have been applied
+# on this box. This guard's step 3 remedies an active-but-offline runner by
+# restarting it, and under GitHub's stock KillMode=process a restart orphans the
+# Runner.Listener instead of replacing it. Two listeners then fight over one
+# agentId, GitHub keeps the runner offline, and this guard restarts it again —
+# on 2026-08-18 that loop took 13 of 19 runners offline twice in 20 minutes.
+# KillMode=mixed (installed by that script) is what makes this remedy safe.
+#
 # Installs:
 #   /opt/server-watchdog/runner-guard.sh   (the engine)
 #   /etc/systemd/system/runner-guard.{service,timer}
