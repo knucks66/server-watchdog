@@ -71,3 +71,5 @@ endpoints:
     url: https://api.sundrly.com/health
   - name: UntilYes
     url: https://api.untilyes.com/health
+  - name: Reelmingo
+    url: https://api.reelmingo.com/health
