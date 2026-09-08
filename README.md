@@ -16,7 +16,8 @@ Runs every **5 minutes**. Checks HTTP endpoints from `endpoints.yml`.
 
 ### 2. Container Health & Dependency Check (`container-health.yml`)
 
-Runs every **10 minutes**. SSHes into the server and checks container-level health.
+Runs every **10 minutes**. Runs the shared engine (`scripts/container-health.sh`)
+on the box and reports state.
 
 **What it checks:**
 - SuperTokens → Postgres connectivity (JWKS endpoint vs hello endpoint)
@@ -28,9 +29,16 @@ Runs every **10 minutes**. SSHes into the server and checks container-level heal
 
 **Remediation:** Restarts only the affected container(s) via `docker compose restart` (uses compose labels to find the right project/file). No full server reboot needed.
 
+The same engine runs on-box every **10 minutes** via a systemd timer (Layer 3,
+`scripts/install-container-health.sh`), coordinated with this workflow by a
+flock. Layer 3 is the primary path: it needs no external service, and GitHub was
+delivering this workflow's 10-minute cron roughly 7 times a day with gaps over
+four hours. Set `DRY_RUN=1` to report without restarting anything.
+
 ### 3. Resource Monitor & Cleanup (`resource-monitor.yml`)
 
-Runs every **2 hours**. SSHes into the server and monitors resource usage.
+Runs every **2 hours**. Runs the shared engine (`scripts/resource-monitor.sh`)
+on the box and reports state.
 
 **What it checks:**
 - Disk usage (auto-cleanup at >=85%: prunes images, build cache, and
@@ -40,6 +48,19 @@ Runs every **2 hours**. SSHes into the server and monitors resource usage.
 - Docker resource breakdown (images, containers, volumes, build cache)
 - Container memory/CPU usage (top 10)
 - Orphan containers (from deleted/moved compose files) — auto-removes them
+
+The same engine runs on-box every **2 hours** via a systemd timer (Layer 3,
+`scripts/install-resource-monitor.sh`), coordinated with this workflow by a
+flock. Its unit runs `Nice=10` / `IOSchedulingClass=idle`, because pruning images
+and build cache is heavy sustained I/O and it only ever runs when disk is
+already critical. Set `DRY_RUN=1` to report without deleting anything — worth
+doing on a box you have not run it on before.
+
+**Named volumes are never auto-deleted.** `docker volume prune -f` removes
+unreferenced NAMED volumes too, and on 2026-09-08 this box had eight, including
+`podcastwiz_postgres-data` and `ownersbox_data`. Only 64-hex anonymous volumes
+are removed; named ones are listed for a human. `is_anonymous_volume` in the
+engine carries the reasoning, and `tests/test-resource-monitor.sh` pins it.
 
 ### 4. Load Guard (`load-guard.yml`)
 

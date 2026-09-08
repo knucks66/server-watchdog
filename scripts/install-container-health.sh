@@ -20,7 +20,8 @@
 # To let Layer 3 push events to Ownersbox/JARVIS (same as the Layer 2 workflow),
 # export the creds before running; they are written 0600 to /etc/container-health.env,
 # which the service loads via EnvironmentFile:
-#   sudo OBX_WEBHOOK_URL=https://ownersbox.rumio.world/api/watchdog/event #        OBX_TOKEN=obx_... ./scripts/install-container-health.sh
+#   sudo OBX_WEBHOOK_URL=https://ownersbox.rumio.world/api/watchdog/event \
+#        OBX_TOKEN=obx_... ./scripts/install-container-health.sh
 # Omit them and the on-box push stays off; detection and remediation run anyway.
 
 set -euo pipefail
