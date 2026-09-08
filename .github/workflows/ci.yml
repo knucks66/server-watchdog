@@ -1,0 +1,73 @@
+name: CI
+
+# This repo had no CI. Every workflow in it is a scheduled watchdog that runs
+# against the production host — there was no pull-request gate at all, so the
+# 37 tests under tests/ ran nowhere and a change to the logic that RESTARTS
+# services was merged on inspection alone.
+#
+# The first run of this workflow found scripts/install-runner-guard.sh carrying
+# a UTF-8 BOM, which made it fail on line 1 with "No such file or directory"
+# both as ./script and as `bash script`. The installer could not run at all.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-watchdog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # ubuntu-latest, deliberately, and NOT the fleet's Hetzner runner. This repo
+    # is the external dead-man's switch for that box: its whole value is being
+    # somewhere else when the box is unreachable. Running its CI — or worse, its
+    # scheduled jobs — on the machine under observation would make it blind to
+    # the failure it exists to catch.
+    #
+    # It is affordable because this repo is PUBLIC, so hosted minutes are free
+    # here. The private repos in the fleet exhaust the monthly allowance on
+    # purpose and use self-hosted runners instead; that reasoning does not reach
+    # this one.
+    runs-on: ubuntu-latest
+    name: Tests & Lint
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Shell tests
+        run: |
+          # bash and jq are both preinstalled on ubuntu-latest, and jq matters:
+          # offline_runner_names pipes through `jq ... 2>/dev/null`, so WITHOUT
+          # jq it silently emits nothing and every "selects nothing" assertion
+          # passes for the wrong reason while the two that expect real output
+          # fail. A green run here therefore also depends on jq being present.
+          command -v jq >/dev/null || { echo "::error::jq missing; tests would pass vacuously"; exit 1; }
+          rc=0
+          for t in tests/*.sh; do
+            echo "::group::$t"
+            bash "$t" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Shell lint
+        run: |
+          # -S warning: these scripts reboot the host, reap processes and restart
+          # runner units, so a genuine warning deserves a red build while a style
+          # note does not. This is also the check that catches SC1082 (a UTF-8
+          # BOM), which is how the broken installer was found.
+          docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
+            -S warning scripts/*.sh tests/*.sh
+
+      - name: Parse YAML
+        run: |
+          # endpoints.yml drives what the health check actually probes, so a
+          # malformed one silently narrows monitoring rather than erroring.
+          python3 -c "
+          import sys, yaml
+          for f in ['endpoints.yml']:
+              with open(f) as fh: yaml.safe_load(fh)
+              print(f'{f}: ok')
+          "
