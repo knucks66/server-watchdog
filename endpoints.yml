@@ -15,12 +15,8 @@ endpoints:
     url: https://ai-forge.rumio.world
   - name: OwnersBox
     url: https://ownersbox.rumio.world
-  - name: KittyCams
-    url: https://api.kittycams.rumio.world/health
   - name: The Ledger Lab Academy
     url: https://api.theledgerlab.academy/health
-  - name: Ken's Designs
-    url: https://api.kens-designs.rumio.world/health
   - name: Superior Drones
     url: https://api.superior-drones.com/health
   - name: LaSalle Cat Tree
@@ -49,8 +45,6 @@ endpoints:
     url: https://api.dript-agent.rumio.world/health
   - name: NeuroApparatus
     url: https://api.neuroapparatus.rumio.world/health
-  - name: Bnb supply closet
-    url: https://api.bnb-supply-closet.rumio.world/health
   - name: Air Cleared
     url: https://api.aircleared.com/health
   - name: Volarly
