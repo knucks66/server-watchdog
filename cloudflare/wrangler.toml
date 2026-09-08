@@ -1,0 +1,33 @@
+name = "server-watchdog"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+# Every 2 minutes. Budget against the Workers FREE plan, which is a hard
+# ceiling rather than a bill — exceeding a free limit fails the operation, it
+# does not charge overage:
+#
+#   requests/day            720  of 100,000   (0.7%)
+#   subrequests/invocation  ~14  of 50        (worst case: probe+recheck+
+#                                              reboot+notify+verify)
+#   cron triggers             1  of 5
+#   CPU/invocation        comparisons only, of 10ms (awaiting fetch is not CPU)
+#   KV / D1 / R2           none
+#
+# The 60s recheck happens INSIDE one invocation rather than across two, so this
+# needs no KV for state. Cron invocations get 15 minutes of wall time and
+# waiting does not consume CPU, so the whole down->recheck->reboot->verify
+# sequence fits in a single scheduled run.
+[triggers]
+crons = ["*/2 * * * *"]
+
+[vars]
+# Deliberately NOT all 35 urls from endpoints.yml. They all resolve to the same
+# host, so 35 proves nothing 6 do not, and 35 + a recheck would breach the
+# 50-subrequest ceiling as the portfolio grows. These span different containers
+# and both apex and rumio.world domains, so a single dead service cannot trip
+# the switch on its own.
+PROBE_URLS = "https://ownersbox.rumio.world/api/health,https://api.rumio.world/health,https://axiss.support,https://etaxengine.com,https://api.slotland.rumio.world/api/slot-config,https://whatarewemakingfordinner.com"
+
+# Seconds to wait before the confirming recheck. Matches the GitHub workflow
+# this replaces.
+RECHECK_DELAY_SECONDS = "60"

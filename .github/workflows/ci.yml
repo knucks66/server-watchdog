@@ -61,6 +61,14 @@ jobs:
           docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
             -S warning scripts/*.sh tests/*.sh
 
+      - name: Dead-man's switch tests
+        run: |
+          # The Cloudflare worker decides whether to REBOOT a live production
+          # host, so its decision logic is tested here rather than only in
+          # production. fetch is stubbed; no Hetzner call is ever made.
+          node --check cloudflare/src/worker.js
+          node cloudflare/test/worker.test.mjs
+
       - name: Parse YAML
         run: |
           # endpoints.yml drives what the health check actually probes, so a
