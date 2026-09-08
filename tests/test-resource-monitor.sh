@@ -29,8 +29,14 @@ for fn in is_anonymous_volume disk_action parent_qualifies; do
 done
 
 # The helpers read these; the shipped defaults are asserted separately below.
+# Each carries its own SC2034 waiver: they are consumed by the eval-extracted
+# helpers above, which shellcheck cannot see through. Remove them and
+# disk_action / parent_qualifies compare against an unset variable under `set -u`.
+# shellcheck disable=SC2034
 DISK_CRIT_PCT=85
+# shellcheck disable=SC2034
 DISK_WARN_PCT=70
+# shellcheck disable=SC2034
 ZOMBIE_PER_PARENT_MIN=10
 
 pass=0; fail=0

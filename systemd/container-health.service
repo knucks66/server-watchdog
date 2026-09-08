@@ -1,0 +1,20 @@
+[Unit]
+Description=Container health & dependency check (restarts containers that are up but broken)
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/container-health.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/container-health.sh
+
+# Optional Ownersbox/JARVIS push creds. The leading '-' means the unit still
+# starts if the file is absent — the engine's emit() simply no-ops the push.
+EnvironmentFile=-/etc/container-health.env
+
+# Ordinary priority, unlike load-guard. This engine is not the emergency
+# load-shedder: it restarts broken containers, which is worth doing promptly but
+# never at the expense of the guard that keeps the box alive.
+MemoryMax=192M
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target

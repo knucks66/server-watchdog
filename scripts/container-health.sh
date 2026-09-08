@@ -59,8 +59,15 @@ http_is_broken() {
 # Postgres and is therefore holding a dead connection pool.
 started_before() {
   local dep_ts pg_ts
-  dep_ts=$(date -d "${1:-}" +%s 2>/dev/null || echo 0)
-  pg_ts=$(date -d "${2:-}" +%s 2>/dev/null || echo 0)
+  # Guard emptiness EXPLICITLY rather than relying on `date` to reject it.
+  # GNU date errors on `date -d ""` and yields 0 here, but other builds return
+  # the current time — which compares as newer than the dependent and reads as
+  # "restart it". docker inspect returns empty for a container that is not
+  # running, so that difference is a restart loop against nothing.
+  [ -z "${1:-}" ] && return 1
+  [ -z "${2:-}" ] && return 1
+  dep_ts=$(date -d "$1" +%s 2>/dev/null || echo 0)
+  pg_ts=$(date -d "$2" +%s 2>/dev/null || echo 0)
   [ "$dep_ts" -eq 0 ] && return 1
   [ "$pg_ts" -eq 0 ] && return 1
   [ "$pg_ts" -gt "$dep_ts" ]

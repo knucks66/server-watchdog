@@ -1,0 +1,22 @@
+[Unit]
+Description=Resource monitor & cleanup (disk, RAM, swap, zombies, orphan containers)
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/resource-monitor.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/resource-monitor.sh
+
+EnvironmentFile=-/etc/resource-monitor.env
+
+# Deliberately LOW priority, the opposite of load-guard. This engine prunes
+# images and build cache, which is heavy sustained disk I/O; run at normal
+# priority it would add exactly the pressure the fleet's other guards exist to
+# relieve. It only ever runs when disk is already critical, so finishing a
+# little later costs nothing.
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=256M
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target
