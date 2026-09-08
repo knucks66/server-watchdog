@@ -5,20 +5,12 @@
 # The health-check workflow reads this file from the repo at runtime
 
 endpoints:
-  - name: Slotland
-    url: https://api.slotland.rumio.world/api/slot-config
-  - name: AXISS
-    url: https://api.axiss.rumio.world/health
-  - name: TaxEngine
-    url: https://api.taxengine.rumio.world/health
-  - name: PodcastWiz
-    url: https://api.podcastwiz.rumio.world/health
-  - name: HHM
-    url: https://api.hhm.rumio.world/health
-  - name: LSG
-    url: https://api.lsg.rumio.world/health
-  - name: DayTradePro
-    url: https://api.daytradepro.rumio.world/health
+  - name: Reelmingo
+    url: https://app.reelmingo.com
+  - name: ETaxEngine
+    url: https://etaxengine.com
+  - name: LSG Seeds
+    url: https://api.lsgseeds.com/health
   - name: AI Forge
     url: https://ai-forge.rumio.world
   - name: OwnersBox
@@ -35,8 +27,6 @@ endpoints:
     url: https://api.lasallecattree.com/health
   - name: Rumio
     url: https://api.rumio.world/health
-  - name: WhatAreWeHavingForDinner
-    url: https://api.whatarewehavingfordinner.rumio.world/health
   - name: WhatAreWeMakingForDinner
     url: https://api.whatarewemakingfordinner.com/health
   - name: DaiyTradePro
@@ -53,8 +43,6 @@ endpoints:
     url: https://api.as-isy.rumio.world/health
   - name: Vigil Security
     url: https://api.vigil-security.rumio.world/health
-  - name: Slotlandia
-    url: https://api.slotlandia.rumio.world/health
   - name: The Juliet
     url: https://api.the-juliet-detroit.rumio.world/health
   - name: DripT Agent
