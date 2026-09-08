@@ -73,3 +73,5 @@ endpoints:
     url: https://api.untilyes.com/health
   - name: Reelmingo
     url: https://api.reelmingo.com/health
+  - name: DumBox
+    url: https://api.dumbox.tv/health
