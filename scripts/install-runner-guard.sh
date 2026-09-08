@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 #
 # Install Layer 3 of the Runner Guard: the on-box systemd timer that runs the
 # runner-guard engine every 2 minutes. This is the fast local fail-safe for
