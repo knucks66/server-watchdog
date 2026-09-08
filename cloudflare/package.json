@@ -1,0 +1,5 @@
+{
+  "name": "server-watchdog-deadman",
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,83 @@
+# Layer 1 — the external dead-man's switch
+
+The only part of the watchdog that must not run on the box it watches. When the
+host is wedged, nothing on it can reboot it.
+
+## Why this exists
+
+`health-check.yml` asked GitHub for a five-minute cron. GitHub delivered it
+roughly **7 times a day** — gaps over four hours. Every run succeeded, so
+nothing looked wrong on the dashboard; the switch had quietly degraded from
+5-minute to ~4-hour resolution, which is precisely the failure it exists to
+catch. GitHub de-prioritises high-frequency `schedule` events and offers no
+guarantee, least of all on public repos.
+
+Layers 2 and 3 are unaffected by any of this — they need a live host anyway.
+
+## What it costs: nothing, and it cannot
+
+The Workers **free** plan is a ceiling, not a bill. Exceeding a free limit makes
+the operation fail; it does not charge overage.
+
+| resource | this worker | free limit | usage |
+|---|---|---|---|
+| requests/day | 720 (every 2 min) | 100,000 | 0.7% |
+| subrequests/invocation | 15 worst case | 50 | 30% |
+| cron triggers | 1 | 5 | 20% |
+| CPU/invocation | comparisons only | 10 ms | trivial |
+| KV / D1 / R2 | none | — | — |
+
+Two choices keep it there. It probes **6 representative URLs, not all 35** from
+`endpoints.yml` — they all resolve to the same host, so 35 proves nothing 6 do
+not, and 35 plus a recheck would breach the 50-subrequest ceiling as the
+portfolio grows. And the 60-second recheck happens **inside one invocation**
+(cron runs get 15 minutes of wall time, and waiting is not CPU), so no KV is
+needed to carry state between runs.
+
+## What it will and will not reboot
+
+Only a **transport failure** counts as down. Any HTTP response at all — 404,
+502, 503 — means the host answered, so a broken app on a live box never
+triggers a reboot. All six probes must fail, twice, 60 seconds apart. There is a
+test for each of those cases.
+
+The `/probe` route reports but **never reboots**: a URL anyone can hit must not
+be able to restart the host.
+
+## Deploy
+
+Run these yourself — they involve your credentials, which should not pass
+through anyone else's hands.
+
+```bash
+cd cloudflare
+npx wrangler login
+
+# Secrets. Same values as the GitHub repo secrets of the same name.
+npx wrangler secret put HETZNER_API_TOKEN
+npx wrangler secret put HETZNER_SERVER_ID
+npx wrangler secret put OBX_WEBHOOK_URL      # optional, for JARVIS reporting
+npx wrangler secret put OBX_TOKEN            # optional
+
+npx wrangler deploy
+```
+
+Verify before trusting it:
+
+```bash
+# Should list all six probes as reachable. Reports only; never reboots.
+curl https://server-watchdog.<your-subdomain>.workers.dev/probe
+```
+
+Then watch one cron fire:
+
+```bash
+npx wrangler tail
+```
+
+## Only after that: retire the GitHub copy
+
+`health-check.yml` is deliberately **left in place** by the commit that adds
+this. Until the Worker is deployed and verified, it is the only dead-man's
+switch there is, and removing it first would leave none. Delete it once
+`/probe` answers and you have seen a scheduled run in `wrangler tail`.

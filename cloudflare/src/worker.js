@@ -1,0 +1,135 @@
+/**
+ * Layer 1 — the external dead-man's switch.
+ *
+ * This is the ONLY part of the watchdog that must not run on the box it
+ * watches: when the host is wedged, nothing on it can reboot it. Layers 2 and 3
+ * (the GitHub workflows and the on-box systemd timers) both require a live host
+ * and are unaffected by this file.
+ *
+ * It replaces health-check.yml, which asked for a five-minute cron but was delivered
+ * by GitHub roughly 7 times a day — gaps over four hours. Every run succeeded,
+ * so nothing looked wrong; the switch had quietly degraded from 5-minute to
+ * ~4-hour resolution, which is exactly the failure it exists to catch.
+ *
+ * Runs entirely inside the Workers free tier; see wrangler.toml for the budget.
+ */
+
+const HETZNER_API = "https://api.hetzner.cloud/v1";
+
+/** One probe. Any HTTP response at all — including 4xx/5xx — means the host is
+ *  answering, so only a transport failure counts as down. A 502 from Caddy is a
+ *  broken app on a LIVE box, and rebooting for that would be a self-inflicted
+ *  outage. */
+async function isReachable(url, timeoutMs = 15000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: ctl.signal,
+      redirect: "manual",
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    return { url, ok: true, status: res.status };
+  } catch (err) {
+    return { url, ok: false, status: 0, error: String(err).slice(0, 120) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function probeAll(urls) {
+  const results = await Promise.all(urls.map((u) => isReachable(u)));
+  return { results, allDown: results.every((r) => !r.ok) };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Report to Ownersbox/JARVIS. Never throws: a failed notification must not
+ *  prevent a reboot, which is the part that actually recovers the host. */
+async function notify(env, level, action, detail) {
+  if (!env.OBX_WEBHOOK_URL) return;
+  try {
+    await fetch(env.OBX_WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(env.OBX_TOKEN ? { Authorization: `Bearer ${env.OBX_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({
+        source: "cloudflare-deadman",
+        level,
+        action,
+        detail,
+        at: new Date().toISOString(),
+      }),
+    });
+  } catch (_) {
+    /* deliberately swallowed — see above */
+  }
+}
+
+async function reboot(env) {
+  const res = await fetch(
+    `${HETZNER_API}/servers/${env.HETZNER_SERVER_ID}/actions/reboot`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.HETZNER_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    },
+  );
+  return { ok: res.status === 200 || res.status === 201, status: res.status };
+}
+
+export async function runCheck(env) {
+  const urls = (env.PROBE_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (urls.length === 0) return { verdict: "misconfigured", reason: "no PROBE_URLS" };
+
+  const first = await probeAll(urls);
+  if (!first.allDown) {
+    return { verdict: "up", reachable: first.results.filter((r) => r.ok).length, total: urls.length };
+  }
+
+  // Everything failed. Confirm before acting: a reboot is destructive to every
+  // service on the box, and a transient network partition between Cloudflare
+  // and Hetzner looks identical to a dead host from here.
+  await sleep(Number(env.RECHECK_DELAY_SECONDS || 60) * 1000);
+  const second = await probeAll(urls);
+  if (!second.allDown) {
+    await notify(env, "warning", "recovered-on-recheck",
+      `all ${urls.length} probes failed, then recovered within the recheck window`);
+    return { verdict: "recovered", total: urls.length };
+  }
+
+  if (!env.HETZNER_API_TOKEN || !env.HETZNER_SERVER_ID) {
+    await notify(env, "critical", "cannot-reboot",
+      "host unreachable but HETZNER_API_TOKEN / HETZNER_SERVER_ID are unset");
+    return { verdict: "down", rebooted: false, reason: "missing credentials" };
+  }
+
+  const r = await reboot(env);
+  await notify(env, "critical", r.ok ? "rebooted" : "reboot-failed",
+    `all ${urls.length} probes failed twice ${env.RECHECK_DELAY_SECONDS || 60}s apart; ` +
+    `Hetzner reboot returned HTTP ${r.status}`);
+  return { verdict: "down", rebooted: r.ok, hetznerStatus: r.status };
+}
+
+export default {
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runCheck(env));
+  },
+
+  /** Manual trigger for verifying a deploy without waiting for the cron, and
+   *  for confirming the probe list is right. Reports only — it never reboots,
+   *  because a URL anyone can hit must not be able to restart the host. */
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname !== "/probe") {
+      return new Response("server-watchdog dead-man's switch\n", { status: 200 });
+    }
+    const urls = (env.PROBE_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const { results, allDown } = await probeAll(urls);
+    return Response.json({ allDown, results }, { status: 200 });
+  },
+};
