@@ -1,14 +1,36 @@
 name: Resource Monitor & Cleanup
-
+# Layer 2 of the resource monitor. Runs the shared engine
+# (scripts/resource-monitor.sh) on the box and reports state. The same engine
+# runs on-box every 2 hours via systemd timer (Layer 3); a flock serializes
+# the two cadences.
+#
+# Layer 3 is the primary recovery path because it doesn't depend on any external
+# service. This layer is the cloud-visible cadence and the backstop for when the
+# on-box timer isn't installed — the same split load-guard and runner-health use.
+#
+# The checks used to live inline here as a long series of `ssh "..."` round-trips
+# per run, which is both slow and the fail2ban risk the SSH sentinel below warns
+# about. They now live in the engine, so there is ONE implementation for both
+# layers instead of two that drift.
+#
+# The engine's volume pruning is anonymous-volumes-only, and deliberately so: a
+# blanket `docker volume prune` would have destroyed podcastwiz_postgres-data on
+# 2026-08-05. See is_anonymous_volume in the engine, and its tests.
 on:
   schedule:
-    - cron: '0 */2 * * *'  # Every 2 hours
+    - cron: '0 */2 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: resource-monitor
+  cancel-in-progress: false
 
 jobs:
   resource-monitor:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -17,286 +39,51 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
-
-          # Sentinel check — fail the workflow immediately if SSH doesn't work,
-          # rather than letting every downstream `ssh ... || echo "0"` mask the
-          # failure (causing the workflow to "succeed" with all-zero metrics).
+          # Sentinel check — fail immediately if SSH doesn't work, rather than
+          # letting the run continue and trigger fail2ban with retries.
           if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
-            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY secret and that the runner IP is not banned by fail2ban on the server"
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY / SERVER_IP and fail2ban"
             exit 1
           fi
           echo "✅ SSH connectivity verified"
 
-      - name: Check disk usage
-        id: disk
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          DISK_PCT=$($SSH "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "0")
-          DISK_AVAIL=$($SSH "df -h / --output=avail | tail -1 | tr -d ' '" 2>/dev/null || echo "unknown")
-          echo "Disk usage: ${DISK_PCT}% (${DISK_AVAIL} available)"
-          echo "disk_pct=$DISK_PCT" >> "$GITHUB_OUTPUT"
-
-          if [ "$DISK_PCT" -ge 85 ]; then
-            echo "needs_cleanup=true" >> "$GITHUB_OUTPUT"
-            echo "⚠️ Disk usage critical (${DISK_PCT}%) — will run cleanup"
-          elif [ "$DISK_PCT" -ge 70 ]; then
-            echo "needs_cleanup=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ Disk usage elevated (${DISK_PCT}%) — monitoring"
-          else
-            echo "needs_cleanup=false" >> "$GITHUB_OUTPUT"
-            echo "✅ Disk usage healthy (${DISK_PCT}%)"
-          fi
-
-      - name: Check memory and swap
-        id: memory
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          MEM_INFO=$($SSH "free -m" 2>/dev/null || echo "")
-          echo "$MEM_INFO"
-
-          MEM_TOTAL=$($SSH "free -m | awk '/Mem:/ {print \$2}'" 2>/dev/null || echo "0")
-          MEM_AVAIL=$($SSH "free -m | awk '/Mem:/ {print \$7}'" 2>/dev/null || echo "0")
-          SWAP_TOTAL=$($SSH "free -m | awk '/Swap:/ {print \$2}'" 2>/dev/null || echo "0")
-          SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "0")
-
-          echo ""
-          echo "RAM available: ${MEM_AVAIL}MB / ${MEM_TOTAL}MB"
-          echo "Swap used: ${SWAP_USED}MB / ${SWAP_TOTAL}MB"
-
-          if [ "$MEM_AVAIL" -lt 300 ] 2>/dev/null; then
-            echo "⚠️ RAM critically low (${MEM_AVAIL}MB available)"
-          fi
-
-          if [ "$SWAP_TOTAL" -gt 0 ] 2>/dev/null; then
-            SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
-            echo "Swap usage: ${SWAP_PCT}%"
-            if [ "$SWAP_PCT" -ge 80 ]; then
-              echo "⚠️ Swap usage critical (${SWAP_PCT}%) — server may need more RAM"
-            fi
-          fi
-
-      - name: Check and kill zombie processes
-        id: zombies
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          ZOMBIE_COUNT=$($SSH "ps -eo stat | grep -c Z" 2>/dev/null || echo "0")
-          echo "Zombie processes: $ZOMBIE_COUNT"
-
-          if [ "$ZOMBIE_COUNT" -gt 100 ]; then
-            echo "needs_zombie_cleanup=true" >> "$GITHUB_OUTPUT"
-            echo "⚠️ $ZOMBIE_COUNT zombie processes detected — will identify and restart parent containers"
-
-            # Find parent PIDs spawning zombies, with their zombie counts
-            ZOMBIE_PARENTS=$($SSH "ps -eo ppid,stat | awk '\$2 ~ /Z/ {print \$1}' | sort | uniq -c | sort -rn | head -5" 2>/dev/null || echo "")
-            echo ""
-            echo "Top zombie-spawning parents:"
-            echo "$ZOMBIE_PARENTS"
-
-            # For each parent, find its container and restart it
-            while read -r count ppid; do
-              [ -z "$ppid" ] && continue
-              [ "$count" -lt 10 ] && continue
-
-              CGROUP=$($SSH "cat /proc/$ppid/cgroup 2>/dev/null | head -1" || echo "")
-              CONTAINER_ID=$(echo "$CGROUP" | grep -o '[a-f0-9]\{64\}' | head -1)
-
-              if [ -n "$CONTAINER_ID" ]; then
-                CONTAINER_NAME=$($SSH "docker inspect --format '{{.Name}}' ${CONTAINER_ID:0:12}" 2>/dev/null | tr -d '/')
-                WORKDIR=$($SSH "docker inspect --format '{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}' ${CONTAINER_ID:0:12}" 2>/dev/null || echo "")
-                SERVICE=$($SSH "docker inspect --format '{{index .Config.Labels \"com.docker.compose.service\"}}' ${CONTAINER_ID:0:12}" 2>/dev/null || echo "")
-
-                echo ""
-                echo "🔄 Container '$CONTAINER_NAME' (PID $ppid) has $count zombies"
-
-                if [ -n "$WORKDIR" ] && [ -n "$SERVICE" ]; then
-                  echo "  Restarting via compose: cd $WORKDIR && docker compose restart $SERVICE"
-                  $SSH "cd $WORKDIR && docker compose restart $SERVICE" 2>&1
-                else
-                  echo "  Restarting directly: docker restart ${CONTAINER_ID:0:12}"
-                  $SSH "docker restart ${CONTAINER_ID:0:12}" 2>&1
-                fi
-              else
-                echo "⚠️ PID $ppid ($count zombies) is not in a container — skipping"
-              fi
-            done <<< "$ZOMBIE_PARENTS"
-
-            # Verify
-            sleep 5
-            NEW_COUNT=$($SSH "ps -eo stat | grep -c Z" 2>/dev/null || echo "?")
-            echo ""
-            echo "Zombie count after cleanup: $NEW_COUNT (was $ZOMBIE_COUNT)"
-          else
-            echo "needs_zombie_cleanup=false" >> "$GITHUB_OUTPUT"
-            echo "✅ Zombie count acceptable ($ZOMBIE_COUNT)"
-          fi
-
-      - name: Check swap pressure
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          SWAP_TOTAL=$($SSH "free -m | awk '/Swap:/ {print \$2}'" 2>/dev/null || echo "0")
-          SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "0")
-          SWAP_FREE=$($SSH "free -m | awk '/Swap:/ {print \$4}'" 2>/dev/null || echo "0")
-
-          if [ "$SWAP_TOTAL" -gt 0 ] 2>/dev/null; then
-            SWAP_PCT=$((SWAP_USED * 100 / SWAP_TOTAL))
-            echo "Swap: ${SWAP_USED}MB / ${SWAP_TOTAL}MB (${SWAP_PCT}% used, ${SWAP_FREE}MB free)"
-
-            if [ "$SWAP_PCT" -ge 95 ]; then
-              echo "⚠️ Swap nearly exhausted (${SWAP_PCT}%) — clearing kernel caches"
-              $SSH "sync && echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
-
-              NEW_SWAP_USED=$($SSH "free -m | awk '/Swap:/ {print \$3}'" 2>/dev/null || echo "?")
-              echo "Swap after cache drop: ${NEW_SWAP_USED}MB (was ${SWAP_USED}MB)"
-            elif [ "$SWAP_PCT" -ge 80 ]; then
-              echo "⚠️ Swap usage elevated (${SWAP_PCT}%) — monitoring"
-            else
-              echo "✅ Swap usage healthy (${SWAP_PCT}%)"
-            fi
-          fi
-
-      - name: Check Docker resource usage
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          echo "=== Docker Disk Usage ==="
-          $SSH "docker system df" 2>/dev/null || true
-
-          echo ""
-          echo "=== Container Memory Usage (top 10) ==="
-          $SSH "docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}' | head -11" 2>/dev/null || true
-
-      - name: Detect orphan containers
-        id: orphans
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          echo "=== Checking for orphan containers ==="
-
-          # Known compose projects and their expected working dirs
-          # If a container's compose config file doesn't exist, it's orphaned
-          ORPHANS=""
-          CONTAINERS=$($SSH "docker ps --format '{{.Names}}'" 2>/dev/null || echo "")
-
-          for container in $CONTAINERS; do
-            CONFIG=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' $container 2>/dev/null" || echo "")
-            if [ -n "$CONFIG" ]; then
-              EXISTS=$($SSH "test -f '$CONFIG' && echo yes || echo no" 2>/dev/null || echo "no")
-              if [ "$EXISTS" = "no" ]; then
-                echo "⚠️ Orphan: $container (compose file missing: $CONFIG)"
-                ORPHANS="$ORPHANS $container"
-              fi
-            fi
-          done
-
-          ORPHANS=$(echo "$ORPHANS" | xargs)
-          if [ -n "$ORPHANS" ]; then
-            echo "found_orphans=true" >> "$GITHUB_OUTPUT"
-            echo "orphan_list=$ORPHANS" >> "$GITHUB_OUTPUT"
-            echo ""
-            echo "🗑️ Orphan containers: $ORPHANS"
-            echo "  (These are from deleted/moved compose files and waste resources)"
-          else
-            echo "found_orphans=false" >> "$GITHUB_OUTPUT"
-            echo "✅ No orphan containers"
-          fi
-
-      - name: Auto-cleanup disk if critical
-        if: steps.disk.outputs.needs_cleanup == 'true'
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          echo "🧹 Running Docker cleanup..."
-
-          # Remove dangling images
-          PRUNED=$($SSH "docker image prune -f" 2>/dev/null || echo "")
-          echo "$PRUNED"
-
-          # Prune build cache (keep 5GB)
-          echo ""
-          echo "Pruning build cache..."
-          $SSH "docker builder prune -f --keep-storage=2GB" 2>/dev/null | tail -1 || true
-
-          # Remove unused volumes — ANONYMOUS ONLY.
-          #
-          # `docker volume prune -f` deletes every unreferenced volume, including
-          # NAMED ones. Named volumes are data somebody deliberately created and
-          # a detached one is usually a service that's temporarily down or was
-          # moved between compose files — not garbage. On 2026-08-05 the box had
-          # 133 unreferenced volumes, and five of them were named, including
-          # `podcastwiz_postgres-data` (a live Postgres data directory). Disk was
-          # at 81%; had it crossed the 85% threshold this step would have
-          # destroyed that database with no prompt and no backup step.
-          #
-          # Anonymous volumes are 64-char hex IDs that Docker creates for
-          # unnamed VOLUME directives and abandons on every container recreate.
-          # Those are the actual churn (128 of the 133) and are safe to drop.
-          # Anything with a human-readable name is left for a human.
-          echo ""
-          echo "Pruning ANONYMOUS unused volumes (named volumes are never auto-deleted)..."
-          ANON=$($SSH "docker volume ls -qf dangling=true | grep -E '^[0-9a-f]{64}\$' | wc -l" 2>/dev/null || echo 0)
-          echo "  anonymous dangling volumes: $ANON"
-          if [ "${ANON:-0}" -gt 0 ]; then
-            $SSH "docker volume ls -qf dangling=true | grep -E '^[0-9a-f]{64}\$' | xargs -r docker volume rm" 2>/dev/null | tail -1 || true
-          fi
-
-          # Surface named orphans so they get a human decision instead of being
-          # silently deleted or silently ignored.
-          NAMED=$($SSH "docker volume ls -qf dangling=true | grep -vE '^[0-9a-f]{64}\$'" 2>/dev/null || true)
-          if [ -n "$NAMED" ]; then
-            echo ""
-            echo "⚠️  Named volumes are unreferenced but were NOT deleted (review manually):"
-            echo "$NAMED" | sed 's/^/    /'
-          fi
-
-          # Report new disk usage
-          echo ""
-          NEW_PCT=$($SSH "df / --output=pcent | tail -1 | tr -d ' %'" 2>/dev/null || echo "?")
-          echo "Disk usage after cleanup: ${NEW_PCT}%"
-
-      - name: Remove orphan containers
-        if: steps.orphans.outputs.found_orphans == 'true'
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-          ORPHANS="${{ steps.orphans.outputs.orphan_list }}"
-
-          echo "Stopping and removing orphan containers: $ORPHANS"
-          for container in $ORPHANS; do
-            echo "  Removing $container..."
-            $SSH "docker stop $container && docker rm $container" 2>&1 || true
-          done
-
-      - name: Report to Ownersbox
-        if: always()
+      - name: Run the resource-monitor engine on the box
+        id: check
         env:
           OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
           OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
         run: |
-          # Mirror this run to Ownersbox/JARVIS. No-ops without the secrets.
-          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
-          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
-          CLEAN="${{ steps.disk.outputs.needs_cleanup }}"
-          DPCT="${{ steps.disk.outputs.disk_pct }}"
-          ORPH="${{ steps.orphans.outputs.found_orphans }}"
-          if [ "$CLEAN" = "true" ] || [ "$ORPH" = "true" ]; then
-            LEVEL=warn; ACTION=pruned
-          else
-            LEVEL=ok; ACTION=none
-          fi
-          # Push interventions only; healthy-run liveness is covered by the
-          # pulled GitHub Actions run status.
-          if [ "$ACTION" = none ] && [ "$LEVEL" = ok ]; then
-            echo "no intervention (action=$ACTION level=$LEVEL) — skipping push"
-            exit 0
-          fi
-          REASON="disk ${DPCT:-?}%"
-          [ "$ORPH" = "true" ] && REASON="${REASON}, orphans removed"
-          NOW=$(date -u +%FT%TZ)
-          curl -fsS -m 10 \
-            -H "Authorization: Bearer ${OBX_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"layer\":\"resource-monitor\",\"level\":\"${LEVEL}\",\"action\":\"${ACTION}\",\"target\":\"host\",\"reason\":\"${REASON}\",\"reported_at\":\"${NOW}\"}" \
-            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
+          # Pipe the repo's engine to the box and run it as root. Using the repo
+          # copy (not the installed one) means this layer always runs the latest
+          # engine and works even if Layer 3 isn't installed. The Ownersbox push
+          # creds are prepended to the *script stream* as exports (carried over
+          # the encrypted SSH channel, never in argv / `ps`) so the engine's
+          # emit() can report this run to JARVIS.
+          OUT=$( { printf 'export OBX_WEBHOOK_URL=%q OBX_TOKEN=%q\n' "${OBX_WEBHOOK_URL:-}" "${OBX_TOKEN:-}"; cat scripts/resource-monitor.sh; } | $SSH 'bash -s' 2>&1 || true)
+          echo "$OUT"
+          RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
+          LEVEL=$(printf '%s' "$RESULT" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+          ACTION=$(printf '%s' "$RESULT" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+          [ -z "$LEVEL" ] && LEVEL=unknown
+          [ -z "$ACTION" ] && ACTION=unknown
+          echo "level=$LEVEL"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Resource Monitor"
+            echo ""
+            echo "- level: \`$LEVEL\`"
+            echo "- action: \`$ACTION\`"
+            echo "- raw: \`$RESULT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if something is broken and nothing could fix it
+        run: |
+          # `critical` from this engine means a problem was detected and NOT
+          # remediated. A green run on that would be the workflow lying.
+          LEVEL="${{ steps.check.outputs.level }}"
+          case "$LEVEL" in
+            critical*) echo "::error::resource-monitor reported critical: nothing remediated"; exit 1 ;;
+            unknown)   echo "::error::no RESULT line — the engine did not complete"; exit 1 ;;
+            *)         echo "level=$LEVEL"; ;;
+          esac

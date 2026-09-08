@@ -1,14 +1,32 @@
 name: Container Health & Dependency Check
-
+# Layer 2 of the container health check. Runs the shared engine
+# (scripts/container-health.sh) on the box and reports state. The same engine
+# runs on-box every 10 minutes via systemd timer (Layer 3); a flock serializes
+# the two cadences.
+#
+# Layer 3 is the primary recovery path because it doesn't depend on any external
+# service. This layer is the cloud-visible cadence and the backstop for when the
+# on-box timer isn't installed — the same split load-guard and runner-health use.
+#
+# The checks used to live inline here as ~15 separate `ssh "..."` round-trips per
+# run, which is both slow and the fail2ban risk the SSH sentinel below warns
+# about. They now live in the engine, so there is ONE implementation for both
+# layers instead of two that drift.
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: container-health
+  cancel-in-progress: false
+
 jobs:
   container-health:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -17,294 +35,51 @@ jobs:
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
-
-          # Sentinel check — fail the workflow immediately if SSH doesn't work,
-          # rather than letting every downstream `ssh ... || echo "0"` fail
-          # silently and trigger fail2ban with password retries.
+          # Sentinel check — fail immediately if SSH doesn't work, rather than
+          # letting the run continue and trigger fail2ban with retries.
           if ! ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} "true" 2>&1; then
-            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY secret and that the runner IP is not banned by fail2ban on the server"
+            echo "❌ SSH auth failed — check SSH_PRIVATE_KEY / SERVER_IP and fail2ban"
             exit 1
           fi
           echo "✅ SSH connectivity verified"
 
-      - name: Check container dependencies
+      - name: Run the container-health engine on the box
         id: check
-        run: |
-          RESTART_LIST=""
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-
-          # ── SuperTokens → Postgres connectivity ──
-          ST_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3567/.well-known/jwks.json" 2>/dev/null || echo "000")
-          echo "SuperTokens JWKS: HTTP $ST_STATUS"
-
-          if [ "$ST_STATUS" = "000" ] || [ "$ST_STATUS" = "500" ]; then
-            ST_HELLO=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3567/hello" 2>/dev/null || echo "000")
-            echo "SuperTokens hello: HTTP $ST_HELLO"
-
-            if [ "$ST_HELLO" != "000" ] && ([ "$ST_STATUS" = "000" ] || [ "$ST_STATUS" = "500" ]); then
-              echo "⚠️ SuperTokens running but lost DB connection"
-              RESTART_LIST="$RESTART_LIST supertokens"
-            elif [ "$ST_HELLO" = "000" ]; then
-              echo "⚠️ SuperTokens container is not responding at all"
-              RESTART_LIST="$RESTART_LIST supertokens"
-            fi
-          else
-            echo "✅ SuperTokens is healthy"
-          fi
-
-          # ── Hasura → Postgres connectivity ──
-          HASURA_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8080/healthz" 2>/dev/null || echo "000")
-          echo "Hasura health: HTTP $HASURA_STATUS"
-
-          if [ "$HASURA_STATUS" = "000" ] || [ "$HASURA_STATUS" = "500" ]; then
-            echo "⚠️ Hasura is unhealthy"
-            RESTART_LIST="$RESTART_LIST hasura"
-          else
-            echo "✅ Hasura is healthy"
-          fi
-
-          # ── Check for recently recreated Postgres ──
-          PG_STARTED=$($SSH "docker inspect --format='{{.State.StartedAt}}' infrastructure-postgres-1 2>/dev/null" || echo "")
-          echo "Postgres started at: $PG_STARTED"
-
-          if [ -n "$PG_STARTED" ]; then
-            DEPENDENTS="infrastructure-supertokens-1 infrastructure-hasura-1"
-            for container in $DEPENDENTS; do
-              CTR_STARTED=$($SSH "docker inspect --format='{{.State.StartedAt}}' $container 2>/dev/null" || echo "")
-
-              if [ -n "$CTR_STARTED" ] && [ -n "$PG_STARTED" ]; then
-                PG_TS=$(date -d "$PG_STARTED" +%s 2>/dev/null || echo "0")
-                CTR_TS=$(date -d "$CTR_STARTED" +%s 2>/dev/null || echo "0")
-
-                if [ "$PG_TS" -gt "$CTR_TS" ] 2>/dev/null; then
-                  SERVICE=$(echo "$container" | sed 's/infrastructure-//;s/-1$//')
-                  echo "⚠️ $container started before Postgres was recreated — needs restart"
-                  if ! echo "$RESTART_LIST" | grep -q "$SERVICE"; then
-                    RESTART_LIST="$RESTART_LIST $SERVICE"
-                  fi
-                fi
-              fi
-            done
-          fi
-
-          # ── Wyze Bridge health (file descriptor exhaustion, crashes) ──
-          WB_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/" 2>/dev/null || echo "000")
-          echo "Wyze Bridge: HTTP $WB_STATUS"
-
-          WB_RESTARTED=false
-          if [ "$WB_STATUS" = "000" ] || [ "$WB_STATUS" = "500" ] || [ "$WB_STATUS" = "502" ]; then
-            # Double-check with a camera API call (the bridge UI might be slow but cameras work)
-            WB_API=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:5050/api/" 2>/dev/null || echo "000")
-            echo "Wyze Bridge API: HTTP $WB_API"
-
-            if [ "$WB_API" = "000" ] || [ "$WB_API" = "500" ] || [ "$WB_API" = "502" ]; then
-              echo "⚠️ Wyze Bridge is unhealthy — restarting"
-              $SSH "docker restart wyze-bridge" 2>&1
-              WB_RESTARTED=true
-              echo "  Waiting 15s for Wyze Bridge to reconnect cameras..."
-              sleep 15
-
-              WB_VERIFY=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
-              if [ "$WB_VERIFY" = "200" ]; then
-                echo "✅ Wyze Bridge recovered"
-              else
-                echo "❌ Wyze Bridge still unhealthy after restart (HTTP $WB_VERIFY)"
-              fi
-            else
-              echo "✅ Wyze Bridge API responding (UI may be slow)"
-            fi
-          else
-            echo "✅ Wyze Bridge is healthy"
-          fi
-
-          # ── Wyze Bridge motion-event staleness ──
-          # Different failure mode than the HTTP check above: the bridge stays
-          # HTTP-200 but its cloud Events API subscription silently drifts and
-          # stops delivering motion events. The recorder is motion-gated, so it
-          # looks healthy in logs but produces no clips. Symptom: motion_ts
-          # frozen at an old timestamp across every camera.
-          if [ "$WB_RESTARTED" = "true" ]; then
-            echo "Skipping motion staleness check — Wyze Bridge was just restarted"
-          else
-            WB_STARTED=$($SSH "docker inspect --format='{{.State.StartedAt}}' wyze-bridge 2>/dev/null" || echo "")
-            if [ -z "$WB_STARTED" ]; then
-              echo "Wyze Bridge not running — skipping motion staleness check"
-            else
-              NOW=$($SSH "date +%s")
-              WB_START_TS=$($SSH "date -d '$WB_STARTED' +%s 2>/dev/null" || echo "0")
-              WB_AGE=$((NOW - WB_START_TS))
-
-              if [ "$WB_AGE" -lt 3600 ]; then
-                echo "Wyze Bridge started ${WB_AGE}s ago — skipping motion staleness check (cold-start grace)"
-              else
-                CAMS=$($SSH "curl -s --max-time 5 http://localhost:5050/" 2>/dev/null | grep -oE 'data-cam="[^"]+"' | cut -d'"' -f2 | sort -u)
-                if [ -z "$CAMS" ]; then
-                  echo "No cameras enumerated from Wyze Bridge homepage — skipping staleness check"
-                else
-                  MAX_TS=0
-                  for cam in $CAMS; do
-                    TS=$($SSH "curl -s --max-time 5 http://localhost:5050/api/$cam" 2>/dev/null | grep -oE '"motion_ts":[0-9]+' | head -1 | cut -d: -f2)
-                    TS=${TS:-0}
-                    if [ "$TS" -gt "$MAX_TS" ]; then MAX_TS=$TS; fi
-                  done
-
-                  STALE_THRESHOLD=21600  # 6 hours
-                  if [ "$MAX_TS" = "0" ]; then
-                    echo "⚠️ Wyze Bridge has never reported motion (bridge up ${WB_AGE}s) — Events API likely broken"
-                    SHOULD_RESTART=true
-                  else
-                    AGE=$((NOW - MAX_TS))
-                    if [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
-                      echo "⚠️ Wyze Bridge newest motion_ts is ${AGE}s old (threshold ${STALE_THRESHOLD}s) — Events API drifted"
-                      SHOULD_RESTART=true
-                    else
-                      echo "✅ Wyze Bridge motion events flowing (newest ${AGE}s old)"
-                      SHOULD_RESTART=false
-                    fi
-                  fi
-
-                  if [ "$SHOULD_RESTART" = "true" ]; then
-                    echo "  Restarting wyze-bridge to refresh cloud Events subscription..."
-                    $SSH "docker restart wyze-bridge" 2>&1
-                    echo "  Waiting 15s..."
-                    sleep 15
-                    WB_VERIFY=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
-                    if [ "$WB_VERIFY" = "200" ]; then
-                      echo "✅ Wyze Bridge restarted (motion events should flow within ~5min)"
-                    else
-                      echo "❌ Wyze Bridge not responding after restart (HTTP $WB_VERIFY)"
-                    fi
-                  fi
-                fi
-              fi
-            fi
-          fi
-
-          # ── Detect unhealthy containers ──
-          echo ""
-          echo "=== Checking for unhealthy containers ==="
-          UNHEALTHY=$($SSH "docker ps --filter health=unhealthy --format '{{.Names}}'" 2>/dev/null || echo "")
-
-          if [ -n "$UNHEALTHY" ]; then
-            echo "⚠️ Unhealthy containers found:"
-            echo "$UNHEALTHY"
-
-            for container in $UNHEALTHY; do
-              # Determine which compose project owns this container
-              PROJECT=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.project\"}}' $container" 2>/dev/null || echo "")
-              SERVICE=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.service\"}}' $container" 2>/dev/null || echo "")
-              CONFIG=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.project.config_files\"}}' $container" 2>/dev/null || echo "")
-              WORKDIR=$($SSH "docker inspect --format='{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}' $container" 2>/dev/null || echo "")
-
-              if [ -n "$SERVICE" ] && [ -n "$WORKDIR" ] && [ -n "$CONFIG" ]; then
-                echo "  Restarting $container ($PROJECT/$SERVICE) via compose..."
-                $SSH "cd $WORKDIR && docker compose -f $(basename $CONFIG) restart $SERVICE" 2>&1
-              else
-                echo "  Restarting $container directly..."
-                $SSH "docker restart $container" 2>&1
-              fi
-            done
-          else
-            echo "✅ No unhealthy containers"
-          fi
-
-          RESTART_LIST=$(echo "$RESTART_LIST" | xargs)
-          echo "restart_list=$RESTART_LIST" >> "$GITHUB_OUTPUT"
-
-          if [ -n "$RESTART_LIST" ]; then
-            echo "needs_restart=true" >> "$GITHUB_OUTPUT"
-            echo ""
-            echo "🔄 Infrastructure containers to restart: $RESTART_LIST"
-          else
-            echo "needs_restart=false" >> "$GITHUB_OUTPUT"
-            echo ""
-            echo "✅ All infrastructure containers healthy"
-          fi
-
-      - name: Restart unhealthy infrastructure containers
-        if: steps.check.outputs.needs_restart == 'true'
-        run: |
-          RESTART_LIST="${{ steps.check.outputs.restart_list }}"
-          echo "Restarting infrastructure containers: $RESTART_LIST"
-
-          for service in $RESTART_LIST; do
-            echo "🔄 Restarting $service..."
-            ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }} \
-              "cd /opt/infrastructure && docker compose restart $service" 2>&1
-            echo "  Done."
-          done
-
-          echo "Waiting 15s for containers to initialize..."
-          sleep 15
-
-      - name: Verify recovery
-        if: steps.check.outputs.needs_restart == 'true'
-        run: |
-          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=10 root@${{ secrets.SERVER_IP }}"
-          RESTART_LIST="${{ steps.check.outputs.restart_list }}"
-          ALL_OK=true
-
-          if echo "$RESTART_LIST" | grep -q "supertokens"; then
-            ST_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:3567/.well-known/jwks.json" 2>/dev/null || echo "000")
-            echo "SuperTokens post-restart: HTTP $ST_STATUS"
-            if [ "$ST_STATUS" = "200" ]; then
-              echo "✅ SuperTokens recovered"
-            else
-              echo "❌ SuperTokens still unhealthy"
-              ALL_OK=false
-            fi
-          fi
-
-          if echo "$RESTART_LIST" | grep -q "hasura"; then
-            HASURA_STATUS=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:8080/healthz" 2>/dev/null || echo "000")
-            echo "Hasura post-restart: HTTP $HASURA_STATUS"
-            if [ "$HASURA_STATUS" = "200" ]; then
-              echo "✅ Hasura recovered"
-            else
-              echo "❌ Hasura still unhealthy"
-              ALL_OK=false
-            fi
-          fi
-
-          # Also verify Wyze Bridge if it was just restarted
-          WB_CHECK=$($SSH "curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:5050/" 2>/dev/null || echo "000")
-          if [ "$WB_CHECK" = "200" ]; then
-            echo "✅ Wyze Bridge healthy"
-          elif [ "$WB_CHECK" = "000" ]; then
-            echo "⚠️ Wyze Bridge not responding (may still be starting)"
-          fi
-
-          if [ "$ALL_OK" = false ]; then
-            echo "⚠️ Some containers did not recover — may need manual intervention"
-            exit 1
-          fi
-
-      - name: Report to Ownersbox
-        if: always()
         env:
           OBX_WEBHOOK_URL: ${{ secrets.OBX_WEBHOOK_URL }}
           OBX_TOKEN: ${{ secrets.OBX_TOKEN }}
         run: |
-          # Mirror this run to Ownersbox/JARVIS. No-ops without the secrets.
-          [ -z "${OBX_WEBHOOK_URL:-}" ] && { echo "No OBX_WEBHOOK_URL — skipping push"; exit 0; }
-          [ -z "${OBX_TOKEN:-}" ] && { echo "No OBX_TOKEN — skipping push"; exit 0; }
-          NEEDS="${{ steps.check.outputs.needs_restart }}"
-          LIST="${{ steps.check.outputs.restart_list }}"
-          if [ "$NEEDS" = "true" ]; then
-            LEVEL=warn; ACTION=restart_container
-          else
-            LEVEL=ok; ACTION=none
-          fi
-          # Push interventions only; healthy-run liveness is covered by the
-          # pulled GitHub Actions run status.
-          if [ "$ACTION" = none ] && [ "$LEVEL" = ok ]; then
-            echo "no intervention (action=$ACTION level=$LEVEL) — skipping push"
-            exit 0
-          fi
-          NOW=$(date -u +%FT%TZ)
-          LIST_ESC=$(printf '%s' "$LIST" | sed 's/\\/\\\\/g; s/"/\\"/g')
-          curl -fsS -m 10 \
-            -H "Authorization: Bearer ${OBX_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"layer\":\"container-health\",\"level\":\"${LEVEL}\",\"action\":\"${ACTION}\",\"target\":\"${LIST_ESC}\",\"reason\":\"restarted: ${LIST_ESC:-none}\",\"reported_at\":\"${NOW}\"}" \
-            "$OBX_WEBHOOK_URL" >/dev/null && echo "reported: $ACTION/$LEVEL" || echo "report POST failed"
+          SSH="ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o IdentitiesOnly=yes -o ConnectTimeout=15 root@${{ secrets.SERVER_IP }}"
+          # Pipe the repo's engine to the box and run it as root. Using the repo
+          # copy (not the installed one) means this layer always runs the latest
+          # engine and works even if Layer 3 isn't installed. The Ownersbox push
+          # creds are prepended to the *script stream* as exports (carried over
+          # the encrypted SSH channel, never in argv / `ps`) so the engine's
+          # emit() can report this run to JARVIS.
+          OUT=$( { printf 'export OBX_WEBHOOK_URL=%q OBX_TOKEN=%q\n' "${OBX_WEBHOOK_URL:-}" "${OBX_TOKEN:-}"; cat scripts/container-health.sh; } | $SSH 'bash -s' 2>&1 || true)
+          echo "$OUT"
+          RESULT=$(printf '%s\n' "$OUT" | grep '^RESULT' | tail -1)
+          LEVEL=$(printf '%s' "$RESULT" | sed -n 's/.*level=\([^ ]*\).*/\1/p')
+          ACTION=$(printf '%s' "$RESULT" | sed -n 's/.*action=\([^ ]*\).*/\1/p')
+          [ -z "$LEVEL" ] && LEVEL=unknown
+          [ -z "$ACTION" ] && ACTION=unknown
+          echo "level=$LEVEL"   >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Container Health"
+            echo ""
+            echo "- level: \`$LEVEL\`"
+            echo "- action: \`$ACTION\`"
+            echo "- raw: \`$RESULT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if something is broken and nothing could fix it
+        run: |
+          # `critical` from this engine means a problem was detected and NOT
+          # remediated. A green run on that would be the workflow lying.
+          LEVEL="${{ steps.check.outputs.level }}"
+          case "$LEVEL" in
+            critical*) echo "::error::container-health reported critical: nothing remediated"; exit 1 ;;
+            unknown)   echo "::error::no RESULT line — the engine did not complete"; exit 1 ;;
+            *)         echo "level=$LEVEL"; ;;
+          esac

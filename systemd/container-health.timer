@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the container health & dependency check every 10 minutes
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/container-health.sh
+
+[Timer]
+# Matches the Layer 2 workflow's declared cadence. That workflow asks GitHub for
+# every 10 minutes and receives roughly 7 runs a day, with gaps over four hours;
+# this timer is what actually delivers the cadence.
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

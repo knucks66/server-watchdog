@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the resource monitor & cleanup every 2 hours
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/resource-monitor.sh
+
+[Timer]
+# Matches the Layer 2 workflow's declared cadence of `0 */2 * * *`.
+OnBootSec=15min
+OnUnitActiveSec=2h
+AccuracySec=5min
+# Persistent, unlike the other watchdog timers: a 2-hourly cleanup missed across
+# a reboot is worth catching up on, whereas a missed 2-minute check simply runs
+# again in two minutes.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
