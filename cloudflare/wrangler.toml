@@ -26,7 +26,12 @@ crons = ["*/2 * * * *"]
 # 50-subrequest ceiling as the portfolio grows. These span different containers
 # and both apex and rumio.world domains, so a single dead service cannot trip
 # the switch on its own.
-PROBE_URLS = "https://ownersbox.rumio.world/api/health,https://api.rumio.world/health,https://axiss.support,https://etaxengine.com,https://api.slotland.rumio.world/api/slot-config,https://whatarewemakingfordinner.com"
+#
+# Every entry must be a hostname the origin actually SERVES. The first deploy
+# probed api.slotland.rumio.world — a pre-Reelmingo name with a stale DNS record
+# and no Caddy site, where the origin closes the TLS handshake. That probe read
+# as permanently down and could never contribute an "it is alive" signal.
+PROBE_URLS = "https://ownersbox.rumio.world/api/health,https://api.rumio.world/health,https://axiss.support,https://etaxengine.com,https://app.reelmingo.com,https://whatarewemakingfordinner.com"
 
 # Seconds to wait before the confirming recheck. Matches the GitHub workflow
 # this replaces.
