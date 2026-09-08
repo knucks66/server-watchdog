@@ -75,6 +75,55 @@ const rebooted = (calls) => calls.filter(([k]) => k === "reboot").length;
   });
 }
 {
+  // The bug this guards: three probed hostnames are Cloudflare-proxied, so a dead
+  // box does not fail to connect — Cloudflare answers 522 on its behalf. Counting
+  // that as reachable meant allDown could never be true and the switch could
+  // never fire, while reporting green throughout the outage.
+  const { out, calls } = await run({ "*": 522 });
+  check("all 522 (cloudflare: origin unreachable) -> reboots", () => {
+    assert.equal(out.verdict, "down");
+    assert.equal(rebooted(calls), 1);
+  });
+}
+{
+  const { out, calls } = await run({ "*": 521 });
+  check("all 521 (web server is down) -> reboots", () => {
+    assert.equal(out.verdict, "down");
+    assert.equal(rebooted(calls), 1);
+  });
+}
+{
+  // 525 is a TLS failure between Cloudflare and the origin, which an expired
+  // certificate produces on a perfectly healthy box. Rebooting for that would be
+  // a self-inflicted outage — and api.slotland.rumio.world was returning exactly
+  // this while the box was fine.
+  const { out, calls } = await run({ "*": 525 });
+  check("all 525 (cloudflare<->origin TLS) -> NEVER reboots", () => {
+    assert.equal(out.verdict, "up");
+    assert.equal(rebooted(calls), 0);
+  });
+}
+{
+  // 520 is Cloudflare's catch-all for an origin that replied with something
+  // unintelligible. The origin did reply, so the box is alive.
+  const { out, calls } = await run({ "*": 520 });
+  check("all 520 (origin replied, unintelligibly) -> NEVER reboots", () => {
+    assert.equal(out.verdict, "up");
+    assert.equal(rebooted(calls), 0);
+  });
+}
+{
+  // Mixed: proxied hosts report the box dead, one DNS-only host still answers.
+  const { out, calls } = await run({
+    "https://a.example": 522,
+    "https://b.example": 200,
+  });
+  check("one proxied 522 but another host answering -> no reboot", () => {
+    assert.equal(out.verdict, "up");
+    assert.equal(rebooted(calls), 0);
+  });
+}
+{
   const { out, calls } = await run({ "*": "throw" });
   check("all transport failures, twice -> reboots exactly once", () => {
     assert.equal(out.verdict, "down");
