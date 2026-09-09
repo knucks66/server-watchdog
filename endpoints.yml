@@ -57,3 +57,5 @@ endpoints:
     url: https://api.reelmingo.com/health
   - name: DumBox
     url: https://api.dumbox.tv/health
+  - name: Innscreen
+    url: https://api.innscreen.com/health
