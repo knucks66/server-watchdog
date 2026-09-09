@@ -4,15 +4,26 @@ Automated health monitoring for the Hetzner server. Runs via GitHub Actions (fre
 
 ## Workflows
 
-### 1. Server Health Check & Auto-Reboot (`health-check.yml`)
+### 1. Server Health Check & Auto-Reboot (Cloudflare Worker — `cloudflare/`)
 
-Runs every **5 minutes**. Checks HTTP endpoints from `endpoints.yml`.
+**Not a GitHub workflow any more.** This is the one layer that must run off the
+box, and GitHub's scheduler was delivering its five-minute cron roughly 7 times
+a day with gaps over four hours — every run green, so nothing looked wrong. The
+dead-man's switch had quietly degraded to ~4-hour resolution. It now runs as a
+Cloudflare Worker on a 2-minute cron trigger, entirely inside the free plan.
 
-- If all endpoints are unreachable, waits 60s and rechecks (avoids false positives)
-- If still down, triggers a soft reboot via the Hetzner Cloud API
-- Verifies the server comes back online
+- Probes six representative endpoints from Cloudflare's edge
+- If all are unreachable, waits 60s and rechecks (inside one invocation, so no KV)
+- If still down, triggers a soft reboot via the Hetzner Cloud API and reports to JARVIS
+- Only a transport failure or a Cloudflare origin error (521–524) counts as down;
+  a 502/503 is a broken app on a LIVE box and never triggers a reboot
 
-**Adding endpoints:** Edit `endpoints.yml` or use the site creation wizard (auto-registers new sites).
+`GET /probe` on the worker reports what it sees and never reboots. See
+[`cloudflare/README.md`](cloudflare/README.md) for the budget, the predicate,
+deployment, and secrets.
+
+`endpoints.yml` is still the list the wider fleet monitors; the worker probes a
+deliberate subset of it (35 + a recheck would breach the 50-subrequest ceiling).
 
 ### 2. Container Health & Dependency Check (`container-health.yml`)
 
@@ -193,8 +204,8 @@ fail-safe (Layer 3).
 
 | Secret | Used by | Description |
 |--------|---------|-------------|
-| `HETZNER_API_TOKEN` | health-check | Hetzner Cloud API token (read/write) |
-| `HETZNER_SERVER_ID` | health-check | Hetzner server ID |
+| `HETZNER_API_TOKEN` | kernel-reboot; **worker secret** for the Cloudflare dead-man's switch | Hetzner Cloud API token (read/write). Not in Infisical as of 2026-09-09 — GitHub secret only, plus the worker copy set via `wrangler secret put` |
+| `HETZNER_SERVER_ID` | kernel-reboot; **worker secret** | Hetzner server ID — `125634084` (`production-cpx41`); not a secret, readable from the box's instance metadata |
 | `SSH_PRIVATE_KEY` | container-health, resource-monitor, load-guard, logind-reaper | Ed25519 private key for root@server |
 | `SERVER_IP` | container-health, resource-monitor, load-guard, logind-reaper | Server IP address |
 | `WATCHDOG_DISCORD_WEBHOOK` | load-guard, logind-reaper | Discord webhook URL for the watchdog's **own** channel (optional — detection/remediation run without it). Posted directly from the workflow, never via ownersbox, so the watchdog stays independent of the platform it may be rescuing. Replaced `NTFY_URL` on 2026-08-17. |

@@ -1,0 +1,7 @@
+
+# Infisical local project link (machine-local, written by `infisical init`)
+.infisical.json
+
+# Infisical keyring written to a literal ~ dir when HOME is unset — NEVER commit
+~/
+**/~/
