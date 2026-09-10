@@ -56,6 +56,21 @@ check_rc "any externals path is PROTECTED" 0 is_protected_workspace_path \
 check_rc "diag path is PROTECTED" 0 is_protected_workspace_path \
   /opt/github-runner-rumio/_diag/node_modules
 
+# The hosted TOOL CACHE. Found by the installer's DRY_RUN on the real box, after
+# the first version of this predicate shipped protecting only _update. This is
+# where actions/setup-node installs Node, and `lib/node_modules` is npm ITSELF —
+# setup-node then treats the version as cached and reuses it, so deleting this
+# yields a Node with no npm and builds that fail until the cache is cleared by
+# hand. This exact path is the one that would have been deleted.
+check_rc "hosted tool cache (setup-node) is PROTECTED" 0 is_protected_workspace_path   /opt/github-runner-ai-forge/_work/_tool/node/22.22.1/x64/lib/node_modules
+check_rc "tool cache, another runner and version" 0 is_protected_workspace_path   /opt/github-runner-podcastwiz-app/_work/_tool/node/20.20.2/x64/lib/node_modules
+# Actions are downloaded once into _actions and re-used; several ship deps.
+check_rc "downloaded action deps are PROTECTED" 0 is_protected_workspace_path   /opt/github-runner-rumio/_work/_actions/actions/setup-node/v4/node_modules
+check_rc "_temp is PROTECTED" 0 is_protected_workspace_path   /opt/github-runner-rumio/_work/_temp/x/node_modules
+# The rule is the leading underscore, not a list of known names, so a directory
+# a future runner release invents is protected without a code change.
+check_rc "an unknown _-prefixed runner dir is PROTECTED" 0 is_protected_workspace_path   /opt/github-runner-rumio/_work/_somethingnew/deep/node_modules
+
 # The runner INSTALL, above _work. Nothing here is ever a build artifact, and
 # .credentials lives at this level.
 check_rc "runner install root is PROTECTED" 0 is_protected_workspace_path /opt/github-runner-rumio

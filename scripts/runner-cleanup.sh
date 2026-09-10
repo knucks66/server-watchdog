@@ -39,25 +39,43 @@ OBX_TOKEN="${OBX_TOKEN:-}"
 # is fair game.
 #
 # THE important predicate here, and the one a naive `find -name node_modules`
-# gets wrong. Of the 60 node_modules directories matched on the first real scan,
-# 34 were `_work/_update/externals/node20|node24/lib/node_modules` — those are
-# the runner's OWN bundled Node runtimes, staged by its self-update mechanism.
-# They look exactly like project dependencies to find(1), are 30+ days old
-# because the runner version is stable, and deleting them risks breaking the
-# runner's ability to upgrade itself. They were worth 260MB; the risk was the
-# whole fleet's CI.
+# gets wrong three separate ways. It is a WHITELIST by convention, not a
+# blacklist of known-bad directories, because enumerating those is a game you
+# lose one directory at a time:
 #
-# The path must also sit under a `_work/` directory. Everything above that is
-# the runner INSTALL — bin/, externals/, .runner, .credentials — and nothing in
-# this engine has any business there.
+#   * The first version protected `_work/_update/externals` (the runner's own
+#     bundled Node runtimes, staged by its self-update mechanism). 34 of the 60
+#     directories matched on the first real scan were these.
+#   * Its DRY_RUN on the box then turned up `_work/_tool/node/22.22.1/x64/lib/
+#     node_modules` — the hosted tool cache, where actions/setup-node installs
+#     Node. That `lib/node_modules` holds npm ITSELF, and setup-node treats the
+#     version as cached and reuses it, so deleting it yields a Node install with
+#     no npm and builds that fail until somebody clears the cache by hand.
+#   * `_work/_actions/` would have been next: actions are downloaded there once
+#     and re-used, several of them shipping their own node_modules.
+#
+# Every one of those is a directory the RUNNER owns, and the runner names all of
+# them with a leading underscore. A repository checkout is `_work/<repo>/<repo>`
+# and never starts with one. So the rule is: the first path segment under
+# `_work/` must not begin with `_`. That covers _tool, _temp, _actions, _update
+# and whatever the next runner release invents.
+#
+# The path must also sit under a `_work/` directory at all. Everything above
+# that is the runner INSTALL — bin/, externals/, .runner, .credentials — and
+# nothing in this engine has any business there.
 is_protected_workspace_path() {
-  case "${1:-}" in
-    *"/_work/_update/"*) return 0 ;;
-    *"/externals/"*)     return 0 ;;
-    *"/_diag/"*)         return 0 ;;
-    */_work/*)           return 1 ;;
-    *)                   return 0 ;;
+  local p="${1:-}" rest
+  case "$p" in
+    *"/externals/"*) return 0 ;;
+    *"/_diag/"*)     return 0 ;;
+    */_work/*)       ;;
+    *)               return 0 ;;
   esac
+  rest="${p#*/_work/}"
+  case "$rest" in
+    _*) return 0 ;;
+  esac
+  return 1
 }
 
 # runner_root_of <path> -> prints the runner install dir, or empty.
