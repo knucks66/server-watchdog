@@ -25,6 +25,31 @@ Cascade: load average hit **280 on an 8-core box (~35×)**, swap went to **100% 
 
 Box facts (for thresholds): **8 cores, ~15.6 GB RAM, 2 GB swap, ~8 GB baseline used by prod containers**, **17 self-hosted runner units** (3 of them `rumio`/`-2`/`-3`), all with `MemoryMax=infinity`.
 
+> **⚠ Those box facts are the MAY 2026 box. They are kept because the
+> thresholds below were derived from them, but do not size anything new against
+> them.** The host was doubled since. Measured 2026-09-10:
+>
+> | | at the incident | 2026-09-10 |
+> |---|---|---|
+> | cores | 8 | **16** |
+> | RAM | ~15.6 GB | **31.3 GB** |
+> | swap | 2 GB | **4 GB** |
+> | prod baseline (`system.slice`) | ~8 GB | **22.4 GB** |
+> | runner units | 17 | **23** |
+>
+> The cap did NOT follow, and that is not obviously wrong: prod grew faster than
+> the box did, so the ~8.5 GB of headroom the 6G/7G figures were chosen to
+> protect is now roughly 12.8 GB available against a 22.4 GB production
+> footprint. Raising the ceiling would spend headroom that production has
+> already claimed.
+>
+> **Health is `memory.pressure`, not `memory.events`.** On 2026-09-10 the slice
+> read `high 7536285` — a number that looks like constant throttling and is not.
+> `MemoryHigh` increments that counter on every reclaim by design. Over the same
+> 14-day uptime `memory.pressure` totalled **303 seconds** (0.025% of the
+> window, `avg10`/`avg60`/`avg300` all 0.00) with **`oom_kill 0`**. The cap is
+> doing its job without stalling builds. Judge it on stall time and kills.
+
 ## Goals
 
 1. A runaway build (or any process group) must **never** be able to starve production containers.
@@ -54,6 +79,20 @@ This is the definitive fix and is independent of any workflow logic. The OOM `ta
    IOWeight=20
    ```
    Leaves ~8.5 GB for prod on a 15.6 GB box.
+
+   > **`IOWeight=20` on this line is INERT and always has been.** `/dev/sda` uses
+   > the `none` I/O scheduler (it is a multiqueue SSD) and blk-iocost QoS is
+   > unconfigured, so the kernel has no mechanism to apply a cgroup I/O weight —
+   > it is accepted and silently ignored. The same is true of every
+   > `IOSchedulingClass=idle` in this repo's units: ionice classes need CFQ/BFQ.
+   > `CPUWeight` and `MemoryHigh`/`MemoryMax` are real and are what actually
+   > contains a runaway build; `Nice` is real too, being CPU scheduling.
+   >
+   > This matters because the 2026-05-28 cascade had a large I/O component, and
+   > the line above reads as if that is throttled. It is not. Real I/O shaping
+   > here needs blk-iocost QoS configured for `sda` first (`io.cost.qos` /
+   > `io.cost.model`), or switching the device to BFQ — which is its own
+   > decision on a host running the fleet's Postgres.
 
 2. Drop-in for every `actions.runner.*` unit (templated; there are 17):
    ```ini
