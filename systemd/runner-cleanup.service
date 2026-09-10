@@ -1,0 +1,24 @@
+[Unit]
+Description=Reclaim cold self-hosted runner workspaces (stale node_modules, old _diag logs)
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/runner-cleanup.sh
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-watchdog/runner-cleanup.sh
+
+EnvironmentFile=-/etc/runner-cleanup.env
+
+# Low priority: this walks and unlinks large directory trees, which is sustained
+# metadata I/O, and it has no deadline.
+#
+# NOTE: there is deliberately no `IOSchedulingClass=idle` here, though the other
+# units in this repo carry one. It would do NOTHING on this box — /dev/sda uses
+# the `none` scheduler (multiqueue SSD) and blk-iocost QoS is unconfigured, so
+# ionice classes and cgroup IOWeight are both silently ignored. Nice still works
+# because it is CPU scheduling, not I/O. See docs/load-guard-spec.md.
+Nice=10
+MemoryMax=256M
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target

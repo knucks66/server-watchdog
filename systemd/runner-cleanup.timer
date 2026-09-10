@@ -1,0 +1,22 @@
+[Unit]
+Description=Reclaim cold self-hosted runner workspaces weekly
+Documentation=https://github.com/knucks66/server-watchdog/blob/main/scripts/runner-cleanup.sh
+
+[Timer]
+# Weekly, and deliberately NOT on a disk threshold. resource-monitor.sh already
+# owns threshold-triggered reclamation and only fires at 85%. The point of this
+# one is that the cold stuff never accumulates into an emergency, so it runs on
+# a calendar whether or not the disk looks fine.
+#
+# Sunday 04:17 rather than a round hour: every cron on this box that someone
+# typed by hand landed on :00, and the deploy workflows fan out on weekday
+# pushes. 04:17 Sunday is the quietest window the fleet has.
+OnCalendar=Sun *-*-* 04:17:00
+RandomizedDelaySec=20min
+AccuracySec=5min
+# A weekly reclaim missed across a reboot is worth catching up on — the same
+# reasoning as resource-monitor.timer, and the opposite of the 2-minute checks.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

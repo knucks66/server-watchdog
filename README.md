@@ -200,6 +200,37 @@ their next restart — re-run when they're idle. See
 (Layer 1), plus the planned detection/remediation workflow (Layer 2) and on-box
 fail-safe (Layer 3).
 
+## Runner workspace cleanup (on-box only)
+
+The runners keep **persistent** workspaces on purpose — a warm `node_modules` is
+most of why a tenant build finishes in minutes. Nothing ever reclaimed them. On
+2026-09-10 the 23 runners held **55G of a 226G disk** (32% of everything used),
+including a 1.2G `node_modules` for a repo whose last build was 149 days
+earlier, and 1.7G of `_diag` logs.
+
+`scripts/runner-cleanup.sh` reclaims only what is provably cold: `node_modules`
+untouched for `NODE_MODULES_AGE_DAYS` (30) and `_diag` logs older than
+`DIAG_AGE_DAYS` (14). Install the weekly timer with
+`scripts/install-runner-cleanup.sh`.
+
+Three things it refuses to touch, each of which a naive
+`find -name node_modules` gets wrong:
+
+- **`_work/_update/externals/node20|node24`** — the runner's OWN bundled Node
+  runtimes, staged by its self-update mechanism. 34 of the 60 directories
+  matched on the first real scan were these. They are 30+ days old because the
+  runner version is stable, and deleting them risks the fleet's ability to
+  upgrade itself.
+- **Anything above `_work/`** — that is the runner install, including
+  `.credentials`.
+- **Any runner currently executing a job**, matched on `Runner.Worker` and
+  never `Runner.Listener` (the listener runs in all 23 at all times, so matching
+  the install dir would report every runner busy forever and reclaim nothing).
+
+Unlike the other engines here it has **no Layer 2 workflow**: it is housekeeping
+with no alerting value, and running it from GitHub would mean SSHing in to
+delete files on a cadence GitHub throttles anyway. `DRY_RUN=1` rehearses it.
+
 ## Required secrets
 
 | Secret | Used by | Description |
