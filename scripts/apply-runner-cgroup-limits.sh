@@ -14,14 +14,17 @@
 # Usage (on the server, as root):
 #   ./apply-runner-cgroup-limits.sh
 # Tunables (env):
-#   SLICE_MEM_MAX   (default 7G)  hard ceiling for ALL runner builds combined
-#   SLICE_MEM_HIGH  (default 6G)  reclaim-pressure soft limit
+#   SLICE_MEM_MAX   (default 12G) hard ceiling for ALL runner builds combined
+#   SLICE_MEM_HIGH  (default 10G) reclaim-pressure soft limit
 #   SLICE_CPU_WEIGHT(default 20)  prod services default to 100, so they win
 #   SLICE_IO_WEIGHT (default 20)
 #
-# Sizing note: prod containers use ~8 GB of the box's ~15.6 GB. 7G for runners
-# leaves ~8.6 GB for prod + kernel. Re-measure prod steady-state before
-# changing; keep >=1 GB headroom.
+# Sizing note (2026-10-03, 16 cores / 31.3 GB): size against production's
+# NON-RECLAIMABLE memory, not system.slice memory.current, which includes page
+# cache. Measured: anon 6.8 GB + shmem 1.9 GB + kernel 3.1 GB = ~12 GB. 12G for
+# runners leaves ~7 GB of margin. 6G/7G was too tight for two concurrent tenant
+# `vite build`s plus ~31 idle listeners and thrashed the whole disk; see
+# docs/load-guard-spec.md, "2026-10-03". Re-measure before changing.
 
 set -euo pipefail
 
@@ -30,8 +33,8 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-SLICE_MEM_MAX="${SLICE_MEM_MAX:-7G}"
-SLICE_MEM_HIGH="${SLICE_MEM_HIGH:-6G}"
+SLICE_MEM_MAX="${SLICE_MEM_MAX:-12G}"
+SLICE_MEM_HIGH="${SLICE_MEM_HIGH:-10G}"
 SLICE_CPU_WEIGHT="${SLICE_CPU_WEIGHT:-20}"
 SLICE_IO_WEIGHT="${SLICE_IO_WEIGHT:-20}"
 
