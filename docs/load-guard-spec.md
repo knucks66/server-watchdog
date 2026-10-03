@@ -49,6 +49,31 @@ Box facts (for thresholds): **8 cores, ~15.6 GB RAM, 2 GB swap, ~8 GB baseline u
 > 14-day uptime `memory.pressure` totalled **303 seconds** (0.025% of the
 > window, `avg10`/`avg60`/`avg300` all 0.00) with **`oom_kill 0`**. The cap is
 > doing its job without stalling builds. Judge it on stall time and kills.
+>
+> **2026-10-03: raised to `MemoryHigh=10G` / `MemoryMax=12G`, because stall
+> time said so.** Two tenant `vite build`s (~1.85 GB each, `max-parallel: 2` in
+> rumio's `deploy-frontend.yml`) plus ~31 idle listeners at ~50 MB each pinned
+> the slice at 6,143 of 6,144 MB. `memory.pressure` held `avg300=53.73`, and the
+> reclaim did not stall only the builds: it kept evicting the listeners' own
+> code pages, which they re-read at ~600 MB per 5 s each, ~1.6 GB/s of reads
+> for the whole box. Host I/O pressure hit 98%, load 130-155, every rumio runner
+> went offline mid-job, and the 24-site deploy could not finish. `system.slice`
+> showed zero memory pressure throughout. Same I/O deadlock as the orphaned
+> builds described further down, reached by a different road: not orphans, but
+> a memory cap small enough to turn ordinary builds into disk thrash.
+>
+> **The headroom argument above measured the wrong thing.** The 22.4 GB
+> "production footprint" was `system.slice` `memory.current`, which counts
+> reclaimable page cache. Production's non-reclaimable memory on 2026-10-03
+> was anon 6.8 GB + shmem 1.9 GB + kernel 3.1 GB, about **12 GB**. A 12G runner
+> ceiling leaves about 7 GB of margin on the 31.3 GB box. After the change the
+> same deploy ran at load < 10 with `memory.pressure` 0.00 in both slices.
+>
+> Applied live with `systemctl set-property runners.slice MemoryHigh=10G
+> MemoryMax=12G`, which writes drop-ins under
+> `/etc/systemd/system.control/runners.slice.d/` that override the unit file.
+> `scripts/apply-runner-cgroup-limits.sh` now defaults to the same values, so
+> re-running it does not quietly put the old cap back.
 
 ## Goals
 
