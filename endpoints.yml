@@ -61,3 +61,5 @@ endpoints:
     url: https://api.innscreen.com/health
   - name: Lettrova
     url: https://api.lettrova.com/health
+  - name: Polish Art Center
+    url: https://api.polartcenter.rumio.world/health
