@@ -61,3 +61,5 @@ endpoints:
     url: https://api.innscreen.com/health
   - name: Lettrova
     url: https://api.lettrova.com/health
+  - name: BC Test Store
+    url: https://api.bctest.rumio.world/health
