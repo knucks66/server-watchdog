@@ -24,7 +24,7 @@ CR=$(printf '\015')
 
 # Source only the pure helpers — the script takes a flock and deletes trees.
 # Extracting from the SHIPPED file means these cannot drift.
-for fn in is_protected_workspace_path runner_root_of older_than_days; do
+for fn in is_protected_workspace_path runner_root_of older_than_days is_stale_install_dir; do
   eval "$(sed -n "/^${fn}() {/,/^}/p" "$SRC" | tr -d "$CR")"
   declare -F "$fn" >/dev/null || { echo "FAIL: could not extract $fn"; exit 1; }
 done
@@ -117,10 +117,24 @@ check_rc "empty now is NOT older" 1 older_than_days "$NOW" "" 30
 check_rc "empty days is NOT older" 1 older_than_days $(( NOW - 99*DAY )) "$NOW" ""
 
 echo
+echo "is_stale_install_dir:"
+# The real layout on 2026-10-29: bin -> bin.2.338.0, two older releases beside it.
+R=/opt/github-runner-axiss
+LB=$R/bin.2.338.0; LE=$R/externals.2.338.0
+check_rc "older bin release is stale" 0 is_stale_install_dir $R/bin.2.336.0 "$LB" "$LE"
+check_rc "older externals release is stale" 0 is_stale_install_dir $R/externals.2.337.0 "$LB" "$LE"
+check_rc "the LIVE bin is never stale" 1 is_stale_install_dir "$LB" "$LB" "$LE"
+check_rc "the LIVE externals is never stale" 1 is_stale_install_dir "$LE" "$LB" "$LE"
+check_rc "the bin symlink itself is not a release dir" 1 is_stale_install_dir $R/bin "$LB" "$LE"
+check_rc "_work is never an install" 1 is_stale_install_dir $R/_work "$LB" "$LE"
+check_rc "unknown live bin means nothing is stale" 1 is_stale_install_dir $R/bin.2.336.0 "" "$LE"
+check_rc "unknown live externals means nothing is stale" 1 is_stale_install_dir $R/bin.2.336.0 "$LB" ""
+
+echo
 echo "shipped defaults:"
 # The engine's own defaults, asserted against the SHIPPED file so this suite
 # cannot keep passing against thresholds nobody uses.
-for pair in "NODE_MODULES_AGE_DAYS:30" "DIAG_AGE_DAYS:14"; do
+for pair in "NODE_MODULES_AGE_DAYS:30" "DIAG_AGE_DAYS:14" "STALE_INSTALL_AGE_DAYS:1" "NPM_CACHE_MAX_MB:4096"; do
   name=${pair%%:*}; want=${pair##*:}
   got=$(grep -m1 "^${name}=" "$SRC" | grep -oE '[0-9]+' | head -1)
   check "$name default is $want" "$want" "$got"

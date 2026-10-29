@@ -25,6 +25,12 @@ LOG=/var/log/runner-cleanup.log
 RUNNER_GLOB="${RUNNER_GLOB:-/opt/github-runner*}"
 NODE_MODULES_AGE_DAYS="${NODE_MODULES_AGE_DAYS:-30}"
 DIAG_AGE_DAYS="${DIAG_AGE_DAYS:-14}"
+# Runner installs left behind by self-update, and its download staging.
+STALE_INSTALL_AGE_DAYS="${STALE_INSTALL_AGE_DAYS:-1}"
+# The runner user's npm cache is only a cache; past this size it is cleared
+# (only while no runner anywhere has a job, since a job may be installing).
+NPM_CACHE_DIR="${NPM_CACHE_DIR:-/home/github-runner/.npm/_cacache}"
+NPM_CACHE_MAX_MB="${NPM_CACHE_MAX_MB:-4096}"
 DRY_RUN="${DRY_RUN:-0}"
 
 OBX_WEBHOOK_URL="${OBX_WEBHOOK_URL:-}"
@@ -103,6 +109,30 @@ older_than_days() {
   case "$now"   in ''|*[!0-9]*) return 1 ;; esac
   case "$days"  in ''|*[!0-9]*) return 1 ;; esac
   [ $(( (now - mtime) / 86400 )) -gt "$days" ]
+}
+
+# is_stale_install_dir <dir> <live_bin> <live_externals> -> 0 if <dir> is an
+# old runner install that self-update left behind, 1 otherwise.
+#
+# Each self-update unpacks the new release into bin.<ver>/ and externals.<ver>/
+# beside the old ones, repoints the bin/ and externals/ symlinks, and never
+# removes the previous pair. On 2026-10-29 twenty-one runners held three
+# releases each (2.336, 2.337, 2.338) — about 0.7G per stale release per runner,
+# and with _work/_update most of the 28G reclaimed by hand that day, at 97% disk.
+#
+# Only bin.* / externals.* siblings, only when BOTH live targets are known (a
+# broken or missing symlink means we cannot tell what is live, so nothing is),
+# and never the live target itself.
+is_stale_install_dir() {
+  local d="${1:-}" lb="${2:-}" le="${3:-}" base
+  [ -n "$d" ] && [ -n "$lb" ] && [ -n "$le" ] || return 1
+  [ "$d" = "$lb" ] && return 1
+  [ "$d" = "$le" ] && return 1
+  base="${d##*/}"
+  case "$base" in
+    bin.[0-9]*|externals.[0-9]*) return 0 ;;
+  esac
+  return 1
 }
 
 # ── side-effecting helpers ───────────────────────────────────────────────────
@@ -193,6 +223,45 @@ while IFS= read -r f; do
   rm -f "$f" 2>/dev/null && diag_removed=$((diag_removed + 1))
 done < <(find $RUNNER_GLOB/_diag -type f -name '*.log' -mtime "+${DIAG_AGE_DAYS}" 2>/dev/null)
 
+# ── stale runner installs + update staging ───────────────────────────────────
+# Skipped for a busy runner, and for anything touched within a day: self-update
+# writes bin.<new>/ and _work/_update/ before it flips the symlinks, and an
+# update caught halfway must be left to finish.
+installs_removed=0
+for root in $RUNNER_GLOB; do
+  [ -d "$root" ] || continue
+  [ -L "$root/bin" ] && [ -L "$root/externals" ] || continue
+  lb=$(readlink -f "$root/bin"); le=$(readlink -f "$root/externals")
+  [ -d "$lb" ] && [ -d "$le" ] || continue
+  if runner_is_busy "$root"; then
+    if [ -z "${busy_seen[$root]:-}" ]; then busy_seen[$root]=1; skipped_busy=$((skipped_busy + 1)); fi
+    continue
+  fi
+  for d in "$root"/bin.* "$root"/externals.* "$root/_work/_update"; do
+    [ -d "$d" ] || continue
+    if [ "$d" != "$root/_work/_update" ]; then
+      is_stale_install_dir "$d" "$lb" "$le" || continue
+    fi
+    mtime=$(stat -c %Y "$d" 2>/dev/null)
+    older_than_days "$mtime" "$NOW" "$STALE_INSTALL_AGE_DAYS" || continue
+    if [ "$DRY_RUN" = "1" ]; then echo "would remove $d"; else rm -rf "$d" 2>/dev/null || continue; fi
+    installs_removed=$((installs_removed + 1))
+  done
+done
+
+# ── oversized npm cache ──────────────────────────────────────────────────────
+# 12G on 2026-10-29. Content-addressed and refetched on demand, so clearing it
+# costs one slower install per repo — but a job installing while it goes could
+# fail, so only when no runner has a job.
+npm_cleared=0
+if [ -d "$NPM_CACHE_DIR" ]; then
+  npm_mb=$(du -sm "$NPM_CACHE_DIR" 2>/dev/null | awk '{print $1}')
+  if [ -n "$npm_mb" ] && [ "$npm_mb" -gt "$NPM_CACHE_MAX_MB" ] && ! pgrep -x Runner.Worker >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "1" ]; then echo "would clear $NPM_CACHE_DIR (${npm_mb}M)"; else rm -rf "$NPM_CACHE_DIR" 2>/dev/null; fi
+    npm_cleared=$npm_mb
+  fi
+fi
+
 # ── result ───────────────────────────────────────────────────────────────────
 after_kb=$(df -k / | awk 'NR==2{print $4}')
 freed_mb=$(( (after_kb - before_kb) / 1024 ))
@@ -200,8 +269,8 @@ freed_mb=$(( (after_kb - before_kb) / 1024 ))
 
 level=ok
 action=none
-[ "$nm_removed" -gt 0 ] || [ "$diag_removed" -gt 0 ] && action=cleanup
-reasons="node_modules=${nm_removed},diag_logs=${diag_removed},freed_mb=${freed_mb},skipped_busy_runners=${skipped_busy}"
+{ [ "$nm_removed" -gt 0 ] || [ "$diag_removed" -gt 0 ] || [ "$installs_removed" -gt 0 ] || [ "$npm_cleared" -gt 0 ]; } && action=cleanup
+reasons="node_modules=${nm_removed},diag_logs=${diag_removed},stale_installs=${installs_removed},npm_cache_mb=${npm_cleared},freed_mb=${freed_mb},skipped_busy_runners=${skipped_busy}"
 [ "$DRY_RUN" = "1" ] && action="dry-run"
 
 ts=$(date -Is)
