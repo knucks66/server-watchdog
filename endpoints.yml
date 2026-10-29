@@ -63,3 +63,5 @@ endpoints:
     url: https://api.lettrova.com/health
   - name: Gazedex
     url: https://api.gazedex.com/health
+  - name: Shop Test
+    url: https://api.shoptest.rumio.world/health
