@@ -95,5 +95,32 @@ for pair in "WYZE_COLD_START_GRACE:3600" "WYZE_MOTION_STALE_SECS:21600"; do
 done
 
 echo
+echo "run guard (how the workflow runs it: piped to bash -s, under set -u):"
+GUARD=$(grep -m1 '^case "${BASH_SOURCE' "$SRC" | tr -d "$CR")
+got=$(printf 'set -u
+%s
+echo BODY
+' "$GUARD" | bash -s 2>&1)
+if [ "$got" = "BODY" ]; then pass=$((pass+1)); printf '  ok   piped to bash -s, the body runs
+'
+else fail=$((fail+1)); printf '  FAIL piped to bash -s: want BODY got %s
+' "$got"; fi
+TMPG=$(mktemp); printf 'set -u
+%s
+echo BODY
+' "$GUARD" > "$TMPG"
+got=$(bash "$TMPG" 2>&1)
+if [ "$got" = "BODY" ]; then pass=$((pass+1)); printf '  ok   run as a file, the body runs
+'
+else fail=$((fail+1)); printf '  FAIL run as a file: want BODY got %s
+' "$got"; fi
+got=$(bash -c "set -u; source '$TMPG'; echo SOURCED" 2>&1)
+if [ "$got" = "SOURCED" ]; then pass=$((pass+1)); printf '  ok   sourced, the body is skipped
+'
+else fail=$((fail+1)); printf '  FAIL sourced: want SOURCED got %s
+' "$got"; fi
+rm -f "$TMPG"
+
+echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

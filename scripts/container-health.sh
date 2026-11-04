@@ -114,7 +114,10 @@ act() {   # act <description> <command...>
 
 # Only run the body when executed. Sourcing (as the tests do) must not restart
 # anything — the same rule runner-guard.sh follows.
-case "${BASH_SOURCE[0]}" in "$0") ;; *) return 0 2>/dev/null || true ;; esac
+# Piped to `bash -s` (the GitHub workflow) BASH_SOURCE is unset, and under
+# set -u reading it bare killed the run before any check: every scheduled
+# run since September ended with no RESULT line. $0 is the fallback.
+case "${BASH_SOURCE[0]:-$0}" in "$0") ;; *) return 0 2>/dev/null || true ;; esac
 
 # Layer 2 and Layer 3 can fire at once; only one may restart things.
 exec 9>"$LOCK" 2>/dev/null || { echo "RESULT action=skip level=ok reasons=no-lockfile"; exit 0; }
