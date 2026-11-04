@@ -103,7 +103,10 @@ run() {   # run <description> <command...>
 }
 
 # Sourcing (as the tests do) must not delete anything.
-case "${BASH_SOURCE[0]}" in "$0") ;; *) return 0 2>/dev/null || true ;; esac
+# Piped to `bash -s` (the GitHub workflow) BASH_SOURCE is unset, and under
+# set -u reading it bare killed the run before any check: every scheduled
+# run since September ended with no RESULT line. $0 is the fallback.
+case "${BASH_SOURCE[0]:-$0}" in "$0") ;; *) return 0 2>/dev/null || true ;; esac
 
 exec 9>"$LOCK" 2>/dev/null || { echo "RESULT action=skip level=ok reasons=no-lockfile"; exit 0; }
 flock -n 9 || { echo "RESULT action=skip level=ok reasons=another-run-holds-the-lock"; exit 0; }
