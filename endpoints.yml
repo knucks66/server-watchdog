@@ -65,3 +65,5 @@ endpoints:
     url: https://api.gazedex.com/health
   - name: Camion blanc
     url: https://api.camionblanccrepes.rumio.world/health
+  - name: Luma Test Store
+    url: https://api.magtest.rumio.world/health
