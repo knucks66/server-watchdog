@@ -63,3 +63,5 @@ endpoints:
     url: https://api.lettrova.com/health
   - name: Gazedex
     url: https://api.gazedex.com/health
+  - name: Camion blanc
+    url: https://api.camion-blanc.rumio.world/health
