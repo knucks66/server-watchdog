@@ -100,7 +100,6 @@ emit() {
     [ $(( now_s - last )) -lt "$OBX_HEARTBEAT_SECS" ] && return 0
     act=heartbeat
   fi
-  date +%s > "$OBX_HB_STATE" 2>/dev/null || true
 
   now=$(date -u +%FT%TZ)
   raw_esc=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -109,7 +108,11 @@ emit() {
     -H "Authorization: Bearer ${OBX_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "{\"layer\":\"runner-guard\",\"level\":\"${lvl}\",\"action\":\"${act}\",\"target\":\"runner\",\"reason\":\"${rsn_esc}\",\"raw\":\"${raw_esc}\",\"reported_at\":\"${now}\"}" \
-    "$OBX_WEBHOOK_URL" >/dev/null 2>&1 || true
+    "$OBX_WEBHOOK_URL" >/dev/null 2>&1 && { date +%s > "$OBX_HB_STATE" 2>/dev/null || true; }   # stamped only once delivered
+  # A push that failed (Ownersbox answering 502 mid-deploy) is not stamped, so
+  # the next run (2 min) tries again instead of waiting a whole heartbeat
+  # interval: two lost beats in a row read as "watchdog silent" (2026-11-25).
+  return 0
 }
 
 # ---------------------------------------------------------------- pure helpers
