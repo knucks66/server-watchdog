@@ -61,3 +61,5 @@ endpoints:
     url: https://api.gazedex.com/health
   - name: Camion blanc
     url: https://api.camionblanccrepes.rumio.world/health
+  - name: BackyardPurr
+    url: https://api.backyardpurr.rumio.world/health
