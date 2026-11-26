@@ -74,6 +74,26 @@ parent_qualifies() {
   [ "$n" -ge "$ZOMBIE_PER_PARENT_MIN" ]
 }
 
+# compose_files_gone LABEL: true only when the container's compose label names
+# at least one file and NONE of them exists any more. The label is a
+# comma-separated LIST when the project was started with more than one file
+# (`-f a.yml -f b.yml`, or a docker-compose.override.yml beside the main file).
+# Testing the whole label as one path called such a container an orphan while
+# every file was in place: on 2026-11-26 that removed rumio-functions, the
+# platform API, and it stayed down for 38 minutes. One file still present means
+# the project is alive, so the container is left alone.
+compose_files_gone() {
+  local label="${1:-}" f found=0
+  [ -n "$label" ] || return 1
+  local IFS=,
+  for f in $label; do
+    [ -n "$f" ] || continue
+    found=1
+    [ -e "$f" ] && return 1
+  done
+  [ "$found" = "1" ]
+}
+
 # ── reporting ────────────────────────────────────────────────────────────────
 emit() {
   local line="$1"
@@ -179,8 +199,7 @@ fi
 ORPHANS=""
 for container in $(docker ps --format '{{.Names}}' 2>/dev/null); do
   CONFIG=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$container" 2>/dev/null || echo "")
-  [ -z "$CONFIG" ] && continue
-  [ -f "$CONFIG" ] && continue
+  compose_files_gone "$CONFIG" || continue
   echo "  orphan: $container (compose file missing: $CONFIG)"
   ORPHANS="$ORPHANS $container"
 done
