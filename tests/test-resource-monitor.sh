@@ -121,6 +121,7 @@ echo
 echo "never_remove (what no clean-up may remove):"
 # The list as shipped, read from the file, so the test cannot pass against a
 # list nobody uses.
+# shellcheck disable=SC2034  # read by never_remove, which is extracted from the shipped file
 NEVER_REMOVE=$(grep -m1 '^NEVER_REMOVE=' "$SRC" | tr -d "$CR" | sed 's/^NEVER_REMOVE="${NEVER_REMOVE:-//; s/}"$//')
 check_rc "rumio-functions is never removed" 0 never_remove rumio-functions
 check_rc "a shared infrastructure container is never removed" 0 never_remove infrastructure-postgres-1
@@ -129,6 +130,7 @@ check_rc "nor the dashboard" 0 never_remove ownersbox-dashboard-1
 check_rc "a tenant's functions container is not protected" 1 never_remove lettrova-functions
 check_rc "a name that only starts like an exact entry is not protected" 1 never_remove rumio-functions-old
 check_rc "an empty name is not protected" 1 never_remove ""
+# shellcheck disable=SC2034
 NEVER_REMOVE=""
 check_rc "an empty list protects nothing" 1 never_remove rumio-functions
 
