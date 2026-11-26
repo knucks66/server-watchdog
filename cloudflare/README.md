@@ -63,6 +63,20 @@ All six probes must fail, twice, 60 seconds apart. There is a test for each row.
 The `/probe` route reports but **never reboots**: a URL anyone can hit must not
 be able to restart the host.
 
+## Endpoints that must answer (`REQUIRED_URLS`)
+
+The switch above asks whether the box is there, so a 502 counts as reachable.
+That is right for a reboot and blind to a broken platform on a healthy box: on
+2026-11-26 `api.rumio.world` answered 502 for 38 minutes and nothing outside the
+box asked. After each run that finds the host up, the worker asks every
+`REQUIRED_URLS` endpoint (the platform's health and the social-login relay). A
+5xx or no answer, twice 30 seconds apart, is reported to Ownersbox as
+`critical` / `required-endpoint-down`, and again every 10 minutes while it
+lasts. A 4xx is the route answering. It never reboots. `/probe` lists these
+under `required`.
+
+A change here reaches production only with `npx wrangler deploy` (below).
+
 ## Deploy
 
 Run these yourself — they involve your credentials, which should not pass

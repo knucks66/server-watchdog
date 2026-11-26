@@ -23,7 +23,7 @@ CR=$(printf '\015')
 
 # Source only the pure helpers — the script takes a flock, prunes volumes and
 # removes containers. Extracting from the SHIPPED file means these cannot drift.
-for fn in is_anonymous_volume disk_action parent_qualifies compose_files_gone; do
+for fn in is_anonymous_volume disk_action parent_qualifies compose_files_gone never_remove; do
   eval "$(sed -n "/^${fn}() {/,/^}/p" "$SRC" | tr -d "$CR")"
   declare -F "$fn" >/dev/null || { echo "FAIL: could not extract $fn"; exit 1; }
 done
@@ -116,6 +116,23 @@ check_rc "two files, both missing: orphan" 0 compose_files_gone "$TMPD/gone.yml,
 check_rc "empty label (not a compose container): not an orphan" 1 compose_files_gone ""
 check_rc "label of only commas: not an orphan" 1 compose_files_gone ",,"
 rm -rf "$TMPD"
+
+echo
+echo "never_remove (what no clean-up may remove):"
+# The list as shipped, read from the file, so the test cannot pass against a
+# list nobody uses.
+# shellcheck disable=SC2034  # read by never_remove, which is extracted from the shipped file
+NEVER_REMOVE=$(grep -m1 '^NEVER_REMOVE=' "$SRC" | tr -d "$CR" | sed 's/^NEVER_REMOVE="${NEVER_REMOVE:-//; s/}"$//')
+check_rc "rumio-functions is never removed" 0 never_remove rumio-functions
+check_rc "a shared infrastructure container is never removed" 0 never_remove infrastructure-postgres-1
+check_rc "nor one added later (prefix)" 0 never_remove infrastructure-newthing-1
+check_rc "nor the dashboard" 0 never_remove ownersbox-dashboard-1
+check_rc "a tenant's functions container is not protected" 1 never_remove lettrova-functions
+check_rc "a name that only starts like an exact entry is not protected" 1 never_remove rumio-functions-old
+check_rc "an empty name is not protected" 1 never_remove ""
+# shellcheck disable=SC2034
+NEVER_REMOVE=""
+check_rc "an empty list protects nothing" 1 never_remove rumio-functions
 
 echo
 echo "shipped defaults:"

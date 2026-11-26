@@ -36,3 +36,16 @@ PROBE_URLS = "https://ownersbox.rumio.world/api/health,https://api.rumio.world/h
 # Seconds to wait before the confirming recheck. Matches the GitHub workflow
 # this replaces.
 RECHECK_DELAY_SECONDS = "60"
+
+# Endpoints that must ANSWER while the host is up: a 5xx or no answer, twice,
+# is reported to Ownersbox as critical (never a reboot), again every 10 minutes
+# while it lasts. Added after 2026-11-26, when api.rumio.world answered 502 for
+# 38 minutes on a healthy box and nothing outside the box asked: the on-box
+# check called a missing container healthy and the GitHub cron ran three times
+# that day. The platform's health and the social-login relay, which every
+# tenant's Google, Apple and Facebook sign-in goes through (it answers 400 to a
+# request with no state, which is the route answering).
+#
+#   subrequests/invocation  +2, +2 on a recheck, +1 notify (still far under 50)
+REQUIRED_URLS = "https://api.rumio.world/health,https://api.rumio.world/api/auth/relay/google"
+REQUIRED_RECHECK_SECONDS = "30"
