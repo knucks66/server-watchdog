@@ -61,3 +61,5 @@ endpoints:
     url: https://api.gazedex.com/health
   - name: Camion blanc
     url: https://api.camionblanccrepes.rumio.world/health
+  - name: Spawnwright
+    url: https://api.spawnwright.rumio.world/health
