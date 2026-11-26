@@ -8,7 +8,7 @@
 // them concurrently let each overwrite the others' stub — which produced two
 // confident, entirely bogus failures the first time this was written.
 import assert from "node:assert";
-import { runCheck } from "../src/worker.js";
+import { runCheck, runRequired, speaksNow } from "../src/worker.js";
 
 let pass = 0, fail = 0;
 const check = (name, fn) => {
@@ -152,6 +152,76 @@ const rebooted = (calls) => calls.filter(([k]) => k === "reboot").length;
     assert.equal(out.verdict, "misconfigured");
   });
 }
+
+// ── required endpoints ───────────────────────────────────────────────────────
+// 2026-11-26: the box was fine and api.rumio.world answered 502 for 38 minutes.
+// The switch above calls that "up", correctly. These must call it down, and
+// must never reboot for it.
+const REQ = {
+  REQUIRED_URLS: "https://api.example/health,https://api.example/relay",
+  REQUIRED_RECHECK_SECONDS: "0",
+  HETZNER_API_TOKEN: "t", HETZNER_SERVER_ID: "1",
+  OBX_WEBHOOK_URL: "https://webhook.example/hook",
+};
+const SPEAKS = 0;                 // the first two minutes of a 10-minute slot
+const QUIET = 4 * 60 * 1000;      // a later run in the same slot
+async function required(behaviour, nowMs = SPEAKS, env = REQ) {
+  const calls = [];
+  globalThis.fetch = stubFetch(behaviour, calls);
+  const out = await runRequired(env, nowMs);
+  return { out, calls };
+}
+const notified = (calls) => calls.filter(([k]) => k === "notify").length;
+{
+  const { out, calls } = await required({ "https://api.example/health": 200, "https://api.example/relay": 400 });
+  check("200 and a 400 (the relay answering) -> up, nothing said", () => {
+    assert.equal(out.verdict, "up");
+    assert.equal(notified(calls), 0);
+  });
+}
+{
+  const { out, calls } = await required({ "https://api.example/health": 502, "https://api.example/relay": 502 });
+  check("502 twice -> down, said once, NEVER a reboot", () => {
+    assert.equal(out.verdict, "down");
+    assert.deepEqual(out.down, ["https://api.example/health", "https://api.example/relay"]);
+    assert.equal(notified(calls), 1);
+    assert.equal(rebooted(calls), 0);
+  });
+}
+{
+  const { out, calls } = await required({ "https://api.example/health": [502, 200], "https://api.example/relay": 400 });
+  check("502 then 200 on the recheck -> recovered, nothing said", () => {
+    assert.equal(out.verdict, "recovered");
+    assert.equal(notified(calls), 0);
+  });
+}
+{
+  const { out, calls } = await required({ "https://api.example/health": 200, "https://api.example/relay": "throw" });
+  check("one endpoint not answering -> down, names only that one", () => {
+    assert.equal(out.verdict, "down");
+    assert.deepEqual(out.down, ["https://api.example/relay"]);
+    assert.equal(notified(calls), 1);
+  });
+}
+{
+  const { out, calls } = await required({ "*": 502 }, QUIET);
+  check("still down later in the same 10 minutes -> down, not said again", () => {
+    assert.equal(out.verdict, "down");
+    assert.equal(out.said, false);
+    assert.equal(notified(calls), 0);
+  });
+}
+{
+  const { out, calls } = await required({ "*": 502 }, SPEAKS, { ...REQ, REQUIRED_URLS: "" });
+  check("no REQUIRED_URLS -> nothing asked", () => {
+    assert.equal(out.verdict, "none");
+    assert.equal(calls.length, 0);
+  });
+}
+check("speaks once in each 10 minutes of 2-minute runs", () => {
+  const runs = [0, 2, 4, 6, 8, 10, 12].map((m) => speaksNow(m * 60 * 1000 + 5000));
+  assert.deepEqual(runs, [true, false, false, false, false, true, false]);
+});
 
 console.log(`\npassed=${pass} failed=${fail}`);
 process.exit(fail === 0 ? 0 : 1);

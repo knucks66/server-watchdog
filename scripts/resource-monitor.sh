@@ -94,6 +94,23 @@ compose_files_gone() {
   [ "$found" = "1" ]
 }
 
+# never_remove NAME: true for a container no clean-up here may remove,
+# whatever its labels say. The orphan rule was wrong once (above) and took the
+# platform API with it; this list is what a second wrong rule cannot reach.
+# Space-separated names; a trailing * matches a prefix.
+NEVER_REMOVE="${NEVER_REMOVE:-rumio-functions infrastructure-* ownersbox-dashboard-1}"
+never_remove() {
+  local name="${1:-}" pat
+  [ -n "$name" ] || return 1
+  for pat in $NEVER_REMOVE; do
+    case "$pat" in
+      *\*) case "$name" in "${pat%\*}"*) return 0 ;; esac ;;
+      *)   [ "$name" = "$pat" ] && return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # ── reporting ────────────────────────────────────────────────────────────────
 emit() {
   local line="$1"
@@ -200,6 +217,12 @@ ORPHANS=""
 for container in $(docker ps --format '{{.Names}}' 2>/dev/null); do
   CONFIG=$(docker inspect --format='{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$container" 2>/dev/null || echo "")
   compose_files_gone "$CONFIG" || continue
+  if never_remove "$container"; then
+    # Said, never removed: a person looks at why its compose file is gone.
+    echo "  PROTECTED: $container looks orphaned (compose file missing: $CONFIG) and is on the never-remove list"
+    problems+=("orphan-protected($container)")
+    continue
+  fi
   echo "  orphan: $container (compose file missing: $CONFIG)"
   ORPHANS="$ORPHANS $container"
 done

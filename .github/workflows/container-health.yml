@@ -5,8 +5,15 @@ name: Container Health & Dependency Check
 # the two cadences.
 #
 # Layer 3 is the primary recovery path because it doesn't depend on any external
-# service. This layer is the cloud-visible cadence and the backstop for when the
-# on-box timer isn't installed — the same split load-guard and runner-health use.
+# service, and it is the ONLY real cadence. The cron below asks for every 10
+# minutes and GitHub delivers it two or three times a day (2026-11-25: 02:39,
+# 11:44 and 20:42 UTC; none during the 38-minute platform outage that night).
+# So this layer is a view of the box from GitHub when it happens to run, and a
+# way to run the engine by hand (workflow_dispatch). It is not a backstop.
+#
+# What watches from outside the box every 2 minutes is the Cloudflare worker
+# (cloudflare/): the dead-man's switch for the whole host, and REQUIRED_URLS
+# for the endpoints that must answer while the host is up.
 #
 # The checks used to live inline here as ~15 separate `ssh "..."` round-trips per
 # run, which is both slow and the fail2ban risk the SSH sentinel below warns

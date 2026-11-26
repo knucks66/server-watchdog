@@ -66,6 +66,53 @@ async function probeAll(urls) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** One REQUIRED endpoint: it must answer, and a server error is not an answer.
+ *
+ *  The dead-man's switch above asks "is the box there", so a 502 from Caddy
+ *  counts as reachable. That is right for a reboot decision and blind to the
+ *  outage of 2026-11-26: the box was fine and api.rumio.world answered 502 for
+ *  38 minutes because one container was gone. Here a 5xx is down. A 4xx is the
+ *  route answering (the social-login relay answers 400 to a request with no
+ *  state), and so is a redirect. */
+async function answers(url, timeoutMs = 15000) {
+  const r = await isReachable(url, timeoutMs);
+  if (!r.ok) return r;
+  if (r.status >= 500) return { url, ok: false, status: r.status, error: "server error" };
+  return r;
+}
+
+/** How often a required endpoint that stays down is reported again. The worker
+ *  keeps no state, so the clock is the throttle: of the runs every 2 minutes,
+ *  the one in each 10-minute slot's first 2 minutes speaks. */
+const REPEAT_EVERY_MS = 10 * 60 * 1000;
+const RUN_EVERY_MS = 2 * 60 * 1000;
+export function speaksNow(nowMs) {
+  return nowMs % REPEAT_EVERY_MS < RUN_EVERY_MS;
+}
+
+/** Ask each REQUIRED_URLS endpoint; one that fails is asked once more after
+ *  `REQUIRED_RECHECK_SECONDS`. Reports the ones down twice. It never reboots:
+ *  a broken app on a live box is not fixed by restarting the box. Skipped when
+ *  the whole host is down, which is the switch's to say. */
+export async function runRequired(env, nowMs = Date.now()) {
+  const urls = (env.REQUIRED_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (urls.length === 0) return { verdict: "none" };
+  const first = await Promise.all(urls.map((u) => answers(u)));
+  const failed = first.filter((r) => !r.ok);
+  if (failed.length === 0) return { verdict: "up", total: urls.length };
+  await sleep(Number(env.REQUIRED_RECHECK_SECONDS || 30) * 1000);
+  const second = await Promise.all(failed.map((r) => answers(r.url)));
+  const down = second.filter((r) => !r.ok);
+  if (down.length === 0) return { verdict: "recovered", total: urls.length };
+  const said = speaksNow(nowMs);
+  if (said) {
+    await notify(env, "critical", "required-endpoint-down",
+      down.map((r) => `${r.url} ${r.status ? `answered HTTP ${r.status}` : "did not answer"}`).join("; ") +
+      " (asked twice; the host itself is reachable)");
+  }
+  return { verdict: "down", down: down.map((r) => r.url), said };
+}
+
 /** Report to Ownersbox/JARVIS. Never throws: a failed notification must not
  *  prevent a reboot, which is the part that actually recovers the host. */
 async function notify(env, level, action, detail) {
@@ -139,7 +186,11 @@ export async function runCheck(env) {
 
 export default {
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runCheck(env));
+    ctx.waitUntil((async () => {
+      const host = await runCheck(env);
+      // With the host itself down the switch has spoken (and may have rebooted).
+      if (host.verdict === "up") await runRequired(env);
+    })());
   },
 
   /** Manual trigger for verifying a deploy without waiting for the cron, and
@@ -152,6 +203,8 @@ export default {
     }
     const urls = (env.PROBE_URLS || "").split(",").map((s) => s.trim()).filter(Boolean);
     const { results, allDown } = await probeAll(urls);
-    return Response.json({ allDown, results }, { status: 200 });
+    const required = await Promise.all(
+      (env.REQUIRED_URLS || "").split(",").map((s) => s.trim()).filter(Boolean).map((u) => answers(u)));
+    return Response.json({ allDown, results, required }, { status: 200 });
   },
 };

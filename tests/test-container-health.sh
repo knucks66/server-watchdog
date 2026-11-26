@@ -21,7 +21,7 @@ CR=$(printf '\015')
 
 # Source only the pure helpers — the script takes a flock and restarts
 # containers. Extracting from the SHIPPED file means these cannot drift.
-for fn in http_is_broken started_before motion_is_stale; do
+for fn in http_is_broken started_before motion_is_stale required_verdict recreate_recipe; do
   eval "$(sed -n "/^${fn}() {/,/^}/p" "$SRC" | tr -d "$CR")"
   declare -F "$fn" >/dev/null || { echo "FAIL: could not extract $fn"; exit 1; }
 done
@@ -86,7 +86,47 @@ check_rc "5 minutes old is fine" 1 motion_is_stale "$NOW" $(( NOW - 300 )) "$SIX
 check_rc "just now is fine" 1 motion_is_stale "$NOW" "$NOW" "$SIX_H"
 
 echo
+echo "required_verdict (containers that must exist):"
+check_out() {
+  local name="$1" want="$2"; shift 2
+  local got; got=$("$@")
+  if [ "$got" = "$want" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$name"
+  else fail=$((fail+1)); printf '  FAIL %s (want=%s got=%s)\n' "$name" "$want" "$got"; fi
+}
+# The 2026-11-26 outage: rumio-functions did not exist and the check said ok.
+check_out "no such container is missing" missing required_verdict "" 0 120
+check_out "running is ok" ok required_verdict running 0 120
+# Docker is restarting it, or a person paused it: not this check's to touch.
+check_out "restarting is left alone" ok required_verdict restarting 0 120
+check_out "paused is left alone" ok required_verdict paused 0 120
+# A deploy stops the old container seconds before it starts the new one.
+check_out "stopped 30s ago waits (a deploy may be mid-swap)" wait required_verdict exited 30 120
+check_out "stopped exactly the grace ago is started" start required_verdict exited 120 120
+check_out "stopped an hour ago is started" start required_verdict exited 3600 120
+check_out "created and never started, past the grace, is started" start required_verdict created 120 120
+check_out "dead past the grace is started" start required_verdict dead 500 120
+check_out "a garbage age is not old enough" wait required_verdict exited junk 120
+check_out "a state this does not know is not acted on" ok required_verdict removing 9999 120
+
+echo
+echo "recreate_recipe (off unless configured):"
+RECIPES="rumio-functions=/opt/rumio-platform:rumio-functions ownersbox-dashboard-1=/opt/ownersbox:dashboard"
+check_out "a configured name gives its directory and service" "/opt/ownersbox dashboard" recreate_recipe ownersbox-dashboard-1 "$RECIPES"
+check_out "the first entry too" "/opt/rumio-platform rumio-functions" recreate_recipe rumio-functions "$RECIPES"
+check_rc "a name with no entry has none" 1 recreate_recipe infrastructure-caddy-1 "$RECIPES"
+check_rc "nothing configured: none" 1 recreate_recipe rumio-functions ""
+check_rc "a name that is only a prefix of an entry has none" 1 recreate_recipe rumio "$RECIPES"
+check_rc "an entry with no service is not a recipe" 1 recreate_recipe x "x=/opt/x"
+
+echo
 echo "shipped defaults:"
+# Nothing is recreated unless a person configures it.
+got=$(grep -m1 '^REQUIRED_RECREATE=' "$SRC" | tr -d "$CR")
+if [ "$got" = 'REQUIRED_RECREATE="${REQUIRED_RECREATE:-}"' ]; then pass=$((pass+1)); printf '  ok   REQUIRED_RECREATE is empty by default\n'
+else fail=$((fail+1)); printf '  FAIL REQUIRED_RECREATE default: %s\n' "$got"; fi
+got=$(grep -m1 '^REQUIRED_CONTAINERS=' "$SRC" | tr -d "$CR")
+case "$got" in *rumio-functions*) pass=$((pass+1)); printf '  ok   rumio-functions is a required container\n' ;;
+  *) fail=$((fail+1)); printf '  FAIL rumio-functions is not on REQUIRED_CONTAINERS\n' ;; esac
 for pair in "WYZE_COLD_START_GRACE:3600" "WYZE_MOTION_STALE_SECS:21600"; do
   name=${pair%%:*}; want=${pair##*:}
   got=$(grep -m1 "^${name}=" "$SRC" | grep -oE '[0-9]+' | head -1)

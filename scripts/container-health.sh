@@ -2,12 +2,14 @@
 #
 # Container Health & Dependency Check — the shared engine.
 #
-# Detects containers that are RUNNING but broken, and restarts them:
+# Detects containers that are RUNNING but broken, and restarts them, and
+# containers that MUST exist and do not:
 #   - SuperTokens / Hasura alive but having lost their Postgres connection
 #   - dependents started BEFORE Postgres was recreated (they hold dead pools)
 #   - Wyze Bridge hard-down, or HTTP-200 while its cloud Events subscription
 #     has silently drifted and stopped delivering motion
 #   - anything Docker itself reports as health=unhealthy
+#   - a required container that is stopped (started again) or gone (critical)
 #
 # Emits one machine-readable `RESULT ...` line, which callers parse.
 #
@@ -37,6 +39,27 @@ WYZE_CONTAINER="${WYZE_CONTAINER:-wyze-bridge}"
 WYZE_COLD_START_GRACE="${WYZE_COLD_START_GRACE:-3600}"    # 1h
 WYZE_MOTION_STALE_SECS="${WYZE_MOTION_STALE_SECS:-21600}" # 6h
 RESTART_SETTLE_SECS="${RESTART_SETTLE_SECS:-15}"
+
+# Containers that must exist. On 2026-11-26, 00:54 to 01:32 UTC, rumio-functions
+# was gone (removed as an "orphan" by resource-monitor) and this check printed
+# `level=ok reasons=none` four times: everything above judges containers that
+# are up, and one that is gone is in nobody's list. Sign-in on every site was
+# down for 38 minutes.
+#
+# Keep the list short and true: a name on it that the box does not run reads
+# as critical on every run. (Hasura is not on it: this host has none.)
+REQUIRED_CONTAINERS="${REQUIRED_CONTAINERS:-rumio-functions infrastructure-postgres-1 infrastructure-caddy-1 infrastructure-supertokens-1 infrastructure-minio-1 ownersbox-dashboard-1}"
+# A stopped one is started only after this long, so a deploy that is between
+# stopping the old container and starting the new one is left alone.
+REQUIRED_STOPPED_GRACE="${REQUIRED_STOPPED_GRACE:-120}"
+# A missing one is looked for again after this long before it is called missing.
+REQUIRED_RECHECK_SECS="${REQUIRED_RECHECK_SECS:-20}"
+# Optional recreate for a missing container: "name=dir:service" entries. Empty
+# by default, so a missing container is reported and nothing is created: a
+# container brought up outside its deploy may start with the wrong environment,
+# and that is a person's call. With an entry, the engine runs
+# `docker compose up -d --no-build --no-deps <service>` in <dir>.
+REQUIRED_RECREATE="${REQUIRED_RECREATE:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
 OBX_WEBHOOK_URL="${OBX_WEBHOOK_URL:-}"
@@ -82,6 +105,40 @@ motion_is_stale() {
   case "$newest" in ''|*[!0-9]*) newest=0 ;; esac
   [ "$newest" -eq 0 ] && return 0
   [ $(( now - newest )) -gt "$threshold" ]
+}
+
+# required_verdict <docker State.Status, empty when the container does not
+# exist> <seconds since it stopped> <grace> -> prints one of:
+#   ok       running (or restarting / paused: Docker or a person has it)
+#   wait     stopped more recently than the grace: a deploy may be mid-swap
+#   start    stopped for longer than the grace: start it
+#   missing  no such container
+required_verdict() {
+  local status="${1:-}" stopped_for="${2:-0}" grace="${3:-120}"
+  case "$stopped_for" in ''|*[!0-9]*) stopped_for=0 ;; esac
+  case "$status" in
+    '') echo missing ;;
+    running|restarting|paused) echo ok ;;
+    exited|created|dead)
+      if [ "$stopped_for" -ge "$grace" ]; then echo start; else echo wait; fi ;;
+    # A state this does not know (removing, a future one) is not acted on.
+    *) echo ok ;;
+  esac
+}
+
+# recreate_recipe <name> <"name=dir:service ..."> -> prints "dir service" for
+# the name, or nothing. Pure.
+recreate_recipe() {
+  local want="${1:-}" entry
+  for entry in ${2:-}; do
+    case "$entry" in
+      "$want"=*:*)
+        entry="${entry#*=}"
+        printf '%s %s\n' "${entry%%:*}" "${entry#*:}"
+        return 0 ;;
+    esac
+  done
+  return 1
 }
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -241,10 +298,65 @@ for container in $UNHEALTHY; do
   fixes+=("$container")
 done
 
+# ── containers that must exist ───────────────────────────────────────────────
+# Only when Docker itself answers: "could not ask" is not "missing".
+missing_unfixed=0
+if docker info >/dev/null 2>&1; then
+  required_status() { docker inspect --format='{{.State.Status}}' "$1" 2>/dev/null || true; }
+  for container in $REQUIRED_CONTAINERS; do
+    STATUS=$(required_status "$container")
+    STOPPED_FOR=0
+    if [ -n "$STATUS" ]; then
+      FINISHED=$(docker inspect --format='{{.State.FinishedAt}}' "$container" 2>/dev/null || echo "")
+      FIN_TS=$(date -d "$FINISHED" +%s 2>/dev/null || echo 0)
+      # Never started ("created") has the zero time: old enough.
+      if [ "$FIN_TS" -le 0 ]; then STOPPED_FOR=$REQUIRED_STOPPED_GRACE; else STOPPED_FOR=$(( NOW - FIN_TS )); fi
+    fi
+    VERDICT=$(required_verdict "$STATUS" "$STOPPED_FOR" "$REQUIRED_STOPPED_GRACE")
+    if [ "$VERDICT" = "missing" ]; then
+      # A deploy that recreates it has it gone for seconds: look once more.
+      [ "$DRY_RUN" = "1" ] || sleep "$REQUIRED_RECHECK_SECS"
+      [ -n "$(required_status "$container")" ] && continue
+    fi
+    case "$VERDICT" in
+      ok|wait) ;;
+      start)
+        problems+=("stopped:$container(${STOPPED_FOR}s)")
+        act "start $container (required, stopped ${STOPPED_FOR}s ago)" docker start "$container"
+        fixes+=("$container")
+        ;;
+      missing)
+        problems+=("missing:$container")
+        if RECIPE=$(recreate_recipe "$container" "$REQUIRED_RECREATE"); then
+          DIR=${RECIPE%% *}; SVC=${RECIPE#* }
+          if [ "$DRY_RUN" = "1" ]; then
+            echo "  DRY_RUN: would compose up -d --no-build --no-deps $SVC in $DIR"
+            fixes+=("$container")
+          elif ( cd "$DIR" && docker compose up -d --no-build --no-deps "$SVC" ) 2>&1 | tail -3 \
+               && [ -n "$(required_status "$container")" ]; then
+            echo "  recreated $container ($SVC in $DIR)"
+            fixes+=("$container")
+          else
+            echo "  could not recreate $container"
+            missing_unfixed=$(( missing_unfixed + 1 ))
+          fi
+        else
+          echo "  MISSING: $container does not exist (no recreate configured: a person brings it back)"
+          missing_unfixed=$(( missing_unfixed + 1 ))
+        fi
+        ;;
+    esac
+  done
+else
+  problems+=("docker-not-answering")
+fi
+
 # ── result ───────────────────────────────────────────────────────────────────
 level=ok; action=none
 if [ "${#fixes[@]}" -gt 0 ]; then level=warn; action="restarted(${#fixes[@]})"; fi
 if [ "${#problems[@]}" -gt 0 ] && [ "${#fixes[@]}" -eq 0 ]; then level=critical; action=none; fi
+# A required container that is still gone is critical whatever else was fixed.
+if [ "$missing_unfixed" -gt 0 ]; then level=critical; fi
 reasons="${problems[*]:-none}"
 [ "${#fixes[@]}" -gt 0 ] && reasons="$reasons fixed: ${fixes[*]}"
 [ "$DRY_RUN" = "1" ] && action="dry-run"

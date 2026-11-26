@@ -37,6 +37,7 @@ on the box and reports state.
 - Wyze Bridge HTTP health (file descriptor exhaustion, crashes)
 - Wyze Bridge motion-event staleness — detects when the bridge's cloud Events API subscription silently drifts (HTTP stays 200, but `motion_ts` frozen across all cameras for >6h). Vigil's recorder is motion-gated, so this failure produces zero clips with no error logs. Restarts the bridge to refresh the subscription.
 - **All containers with Docker health checks** — detects and restarts any container reporting `unhealthy`
+- **Containers that must exist** (`REQUIRED_CONTAINERS`: `rumio-functions`, Postgres, Caddy, SuperTokens, MinIO, the Ownersbox dashboard). One that is stopped for two minutes is started. One that is **gone** is reported as `level=critical reasons=missing:<name>`, whatever else was fixed. On 2026-11-26 `rumio-functions` did not exist for 38 minutes and this check said `ok` four times, because everything else here judges containers that are up. A missing container is not recreated unless `REQUIRED_RECREATE` names its compose directory and service (empty by default: a container brought up outside its deploy may start with the wrong environment).
 
 **Remediation:** Restarts only the affected container(s) via `docker compose restart` (uses compose labels to find the right project/file). No full server reboot needed.
 
@@ -44,7 +45,13 @@ The same engine runs on-box every **10 minutes** via a systemd timer (Layer 3,
 `scripts/install-container-health.sh`), coordinated with this workflow by a
 flock. Layer 3 is the primary path: it needs no external service, and GitHub was
 delivering this workflow's 10-minute cron roughly 7 times a day with gaps over
-four hours. Set `DRY_RUN=1` to report without restarting anything.
+four hours (two or three times a day in November 2026). The on-box timer is
+the only real cadence; what watches from outside the box is the Cloudflare
+worker. Set `DRY_RUN=1` to report without restarting anything.
+
+The resource monitor's clean-ups hold a **never-remove list** (`NEVER_REMOVE`:
+`rumio-functions`, `infrastructure-*`, `ownersbox-dashboard-1`). A container on
+it that looks orphaned is reported (`orphan-protected(<name>)`) and left alone.
 
 ### 3. Resource Monitor & Cleanup (`resource-monitor.yml`)
 
