@@ -23,7 +23,7 @@ CR=$(printf '\015')
 
 # Source only the pure helpers — the script takes a flock, prunes volumes and
 # removes containers. Extracting from the SHIPPED file means these cannot drift.
-for fn in is_anonymous_volume disk_action parent_qualifies; do
+for fn in is_anonymous_volume disk_action parent_qualifies compose_files_gone; do
   eval "$(sed -n "/^${fn}() {/,/^}/p" "$SRC" | tr -d "$CR")"
   declare -F "$fn" >/dev/null || { echo "FAIL: could not extract $fn"; exit 1; }
 done
@@ -99,6 +99,23 @@ check_rc "1 zombie does not" 1 parent_qualifies 1
 check_rc "0 does not" 1 parent_qualifies 0
 check_rc "non-numeric does not" 1 parent_qualifies "x"
 check_rc "empty does not" 1 parent_qualifies ""
+
+echo
+echo "compose_files_gone (orphan containers):"
+# A container is an orphan only when every compose file it was started from is
+# gone. The label is a comma-separated list for a project with two files; read
+# as one path it removed the platform API container (2026-11-26).
+TMPD=$(mktemp -d)
+touch "$TMPD/docker-compose.yml" "$TMPD/docker-compose.override.yml"
+check_rc "one file, present: not an orphan" 1 compose_files_gone "$TMPD/docker-compose.yml"
+check_rc "one file, missing: orphan" 0 compose_files_gone "$TMPD/gone.yml"
+check_rc "two files, both present: not an orphan" 1 compose_files_gone "$TMPD/docker-compose.yml,$TMPD/docker-compose.override.yml"
+check_rc "two files, main present, override removed: not an orphan" 1 compose_files_gone "$TMPD/docker-compose.yml,$TMPD/removed.override.yml"
+check_rc "two files, only the second present: not an orphan" 1 compose_files_gone "$TMPD/gone.yml,$TMPD/docker-compose.override.yml"
+check_rc "two files, both missing: orphan" 0 compose_files_gone "$TMPD/gone.yml,$TMPD/gone2.yml"
+check_rc "empty label (not a compose container): not an orphan" 1 compose_files_gone ""
+check_rc "label of only commas: not an orphan" 1 compose_files_gone ",,"
+rm -rf "$TMPD"
 
 echo
 echo "shipped defaults:"
